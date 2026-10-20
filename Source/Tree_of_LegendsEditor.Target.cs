@@ -8,8 +8,9 @@ public class Tree_of_LegendsEditorTarget : TargetRules
 	public Tree_of_LegendsEditorTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Editor;
-		DefaultBuildSettings = BuildSettingsVersion.V6;
+		DefaultBuildSettings = BuildSettingsVersion.V7;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;
 
-		ExtraModuleNames.AddRange( new string[] { "Tree_of_Legends" } );
+        ExtraModuleNames.AddRange( new string[] { "Tree_of_Legends" } );
 	}
 }
