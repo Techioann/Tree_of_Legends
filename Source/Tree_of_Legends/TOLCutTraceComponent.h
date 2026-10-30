@@ -10,6 +10,7 @@
 class UPrimitiveComponent;
 class ATOLCutFragment;
 class UMaterialInterface;
+class UStaticMesh;
 
 USTRUCT(BlueprintType)
 struct FTOLDormantTreeProfile
@@ -21,6 +22,9 @@ struct FTOLDormantTreeProfile
 	FDataTableRowHandle TreeData;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting", meta=(ClampMin="0.001"))
 	double ResistanceMultiplier = 1.0;
+	/** Minor currency units per cubic metre; configure separately for Wood/Iron. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Value", meta=(ClampMin="0"))
+	int64 UnitPricePerM3Minor = 0;
 };
 
 USTRUCT(BlueprintType)
@@ -187,6 +191,9 @@ public:
 	/** Inventory/Blueprint runtime entry point; equipping explicitly supplies saved durability. */
 	UFUNCTION(BlueprintCallable, Category="Cutting|Axe")
 	bool EquipAxe(FDataTableRowHandle Row, double RemainingDurability);
+	/** Applies to future activations only; never reprices existing trees/fragments. */
+	UFUNCTION(BlueprintCallable, Category="Cutting|Value")
+	bool SetDormantTreeUnitPrice(UStaticMesh* Model, int64 PricePerM3Minor);
 
 private:
 	bool CalculateChopValues(FDataTableRowHandle Material, double Resistance,

@@ -1,6 +1,7 @@
 #include "TOLCutTraceComponent.h"
 #include "TOLCutFragment.h"
 #include "TOLCutMeshData.h"
+#include "TOLCutValuation.h"
 #include "TOLTreeActivationSubsystem.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
@@ -657,6 +658,21 @@ bool UTOLCutTraceComponent::EquipAxe(FDataTableRowHandle Row, double RemainingDu
 	return true;
 }
 
+bool UTOLCutTraceComponent::SetDormantTreeUnitPrice(UStaticMesh* Model,int64 PricePerM3Minor)
+{
+	if (!Model || PricePerM3Minor<0 || PricePerM3Minor>TOLCutValuation::MaxMoney) return false;
+	FTOLDormantTreeProfile* Match=nullptr;
+	for (FTOLDormantTreeProfile& Profile : DormantTreeProfiles)
+	{
+		if (Profile.Model.Mesh!=Model) continue;
+		if (Match) return false;
+		Match=&Profile;
+	}
+	if (!Match) return false;
+	Match->UnitPricePerM3Minor=PricePerM3Minor;
+	return true;
+}
+
 bool UTOLCutTraceComponent::CalculateChopValues(FDataTableRowHandle Material, double Resistance,
 	double& OutGain, double& OutWear, double& OutHealth) const
 {
@@ -754,6 +770,7 @@ bool UTOLCutTraceComponent::TryActivateTree(const FHitResult& Hit, FTOLCutTraceR
 	if (!Data->ConfigureModel(Profile->Model,CandidateSource,Mesh,Error) ||
 		!Mesh->GetComponentTransform().Equals(Transform,0.01) ||
 		!ComputeCutPlaneFromHit(RemapHit(Candidate,Mesh),OutTrace)) return Rollback();
+	if (!Data->ConfigureValuation(Profile->UnitPricePerM3Minor,Error) && Profile->UnitPricePerM3Minor!=0) return Rollback();
 	{
 		// Publish notifications only after committing, so callbacks cannot observe a half-activated tree.
 		TGuardValue<bool> Deferred(bDeferChopNotifications,true);
@@ -956,6 +973,16 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	}
 	for (int32 S=0; S<OtherHalf->GetNumSections(); ++S)
 		if (const FProcMeshSection* Section=OtherHalf->GetProcMeshSection(S)) DetachedGeometry.Add(*Section);
+	double ParentVolume=0,KeptVolume=0,DetachedVolume=0; FString ValueError;
+	const bool CanValue=UTOLCutMeshData::MeasureMeshVolume(SourceMesh,ParentVolume,ValueError) &&
+		TOLCutValuation::Measure(KeptGeometry,Transform,KeptVolume,ValueError) &&
+		TOLCutValuation::Measure(DetachedGeometry,Transform,DetachedVolume,ValueError) &&
+		FMath::Abs(ParentVolume-KeptVolume-DetachedVolume)<=FMath::Max(ParentVolume*0.0001,1.e-10);
+	if ((SourceData->ValueMinor>0 || SourceData->UnitPricePerM3Minor>0) && (!CanValue || !SourceData->bValuationValid))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Cutting: priced split rolled back: %s"),*ValueError);
+		Fragment->Destroy(); OtherHalf->DestroyComponent(); Preview->DestroyComponent(); return false;
+	}
 	TArray<FTOLActiveCut> KeptCuts;
 	for (const FTOLActiveCut& Active : SourceData->ActiveCuts)
 	{
@@ -987,6 +1014,17 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	SourceMesh->SetMaterial(OriginalSections,CapMaterial);
 	OtherHalf->DestroyComponent(); Preview->DestroyComponent();
 	SourceData->MarkGeometryModified();
+	if (CanValue)
+	{
+		// Commit the conserved budget only once both output meshes are committed.
+		if (SourceData->UnitPricePerM3Minor==0 && SourceData->ValueMinor==0) SourceData->bValuationValid=true;
+		SourceData->CommitSplitValuation(FragmentData,KeptVolume,DetachedVolume);
+	}
+	else
+	{
+		SourceData->bValuationValid=false; SourceData->VolumeM3=0; SourceData->ValuationMessage=ValueError;
+		FragmentData->bValuationValid=false; FragmentData->ValuationMessage=ValueError;
+	}
 	RebuildConvexCollision(Fragment->CutMesh);
 	if (!SourceMesh->bUseComplexAsSimpleCollision) RebuildConvexCollision(SourceMesh);
 	if (WasSimulating)
@@ -1020,6 +1058,7 @@ void UTOLCutTraceComponent::DrawCutDebug(const FVector& TraceStart, const FVecto
 	// Keep this separate from the green trace/plane, which only confirms targeting.
 	const uint64 FeedbackKey = (uint64(GetUniqueID()) << 32) | 0x435554;
 	if (GEngine) GEngine->RemoveOnScreenDebugMessage(FeedbackKey);
+	if (GEngine) GEngine->RemoveOnScreenDebugMessage(FeedbackKey+1);
 	const UStaticMeshComponent* StaticSource = Cast<UStaticMeshComponent>(Result.Hit.GetComponent());
 	const bool bDormantTree = StaticSource && DormantTreeProfiles.ContainsByPredicate(
 		[&](const FTOLDormantTreeProfile& Profile) { return Profile.Model.Mesh && Profile.Model.Mesh == StaticSource->GetStaticMesh(); });
@@ -1037,6 +1076,15 @@ void UTOLCutTraceComponent::DrawCutDebug(const FVector& TraceStart, const FVecto
 			*Progress, Chop.DurabilityRemaining, Chop.DurabilityLoss);
 		GEngine->AddOnScreenDebugMessage(FeedbackKey, FMath::Max(DebugDuration, 0.1f),
 			Chop.bToolBroken ? FColor::Red : (Chop.bApplied ? FColor::Green : FColor::Yellow), Message);
+		const AActor* ValueActor=Result.Hit.GetActor();
+		if (const UTOLCutMeshData* Data=ValueActor ? ValueActor->FindComponentByClass<UTOLCutMeshData>() : nullptr)
+		{
+			FString ValueText=TEXT("Remaining: ")+Data->GetValueText().ToString();
+			if (Chop.bTreeCut && LastCutFragment)
+				if (const UTOLCutMeshData* Other=LastCutFragment->FindComponentByClass<UTOLCutMeshData>())
+					ValueText+=TEXT("\nDetached: ")+Other->GetValueText().ToString();
+			GEngine->AddOnScreenDebugMessage(FeedbackKey+1,FMath::Max(DebugDuration,0.1f),FColor::Yellow,ValueText);
+		}
 	}
 
 	const FVector LineEnd = Result.Hit.bBlockingHit ? Result.Hit.ImpactPoint : TraceEnd;
