@@ -41,6 +41,10 @@
 		{
 			"Name": "NiagaraToolsets",
 			"Enabled": true
+		},
+		{
+			"Name": "Terminal",
+			"Enabled": true
 		}
 	]
 }

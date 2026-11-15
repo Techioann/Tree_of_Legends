@@ -9,4 +9,6 @@ ATOLCutFragment::ATOLCutFragment()
 	RootComponent = CutMesh;
 	CutMesh->bUseComplexAsSimpleCollision = false;
 	CutMesh->SetCollisionProfileName(TEXT("PhysicsActor"));
+	// Thin pieces can cross a contact plane between discrete physics steps.
+	CutMesh->SetUseCCD(true);
 }

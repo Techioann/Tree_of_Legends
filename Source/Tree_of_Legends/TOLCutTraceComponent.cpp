@@ -1,4 +1,6 @@
 #include "TOLCutTraceComponent.h"
+#include "Algo/Reverse.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "TOLCutFragment.h"
 #include "TOLCutMeshData.h"
 #include "TOLCutValuation.h"
@@ -32,6 +34,116 @@ namespace
 			FMath::RoundToInt(Position.X * PositionsPerUnit),
 			FMath::RoundToInt(Position.Y * PositionsPerUnit),
 			FMath::RoundToInt(Position.Z * PositionsPerUnit));
+	}
+
+	// FGeomTools::FixPolyWinding simplifies nearly collinear cap vertices. Restore
+	// their actual side-boundary chain, rather than accepting a gap in valuation.
+	bool RestoreCapBoundary(UProceduralMeshComponent* Mesh, int32 CapIndex,
+		const FVector& PlanePoint, const FVector& PlaneNormal)
+	{
+		struct FEdge { FIntVector A,B; int32 Count=0; };
+		auto AddEdge=[](TMap<FString,FEdge>& Edges,FIntVector A,FIntVector B)
+		{
+			if (A==B) return;
+			FString X=A.ToString(),Y=B.ToString();
+			if (X>Y) { Swap(X,Y); Swap(A,B); }
+			FEdge& Edge=Edges.FindOrAdd(X+TEXT("|")+Y);
+			Edge.A=A; Edge.B=B; ++Edge.Count;
+		};
+		TMap<FString,FEdge> BodyEdges;
+		TMap<FIntVector,FVector> Positions;
+		for (int32 S=0; S<CapIndex; ++S)
+		{
+			const FProcMeshSection* Section=Mesh->GetProcMeshSection(S);
+			if (!Section) continue;
+			for (int32 I=0; I+2<Section->ProcIndexBuffer.Num(); I+=3)
+				for (int32 C=0; C<3; ++C)
+				{
+					const FVector A=Section->ProcVertexBuffer[Section->ProcIndexBuffer[I+C]].Position;
+					const FVector B=Section->ProcVertexBuffer[Section->ProcIndexBuffer[I+(C+1)%3]].Position;
+					if (FMath::Abs(FVector::DotProduct(A-PlanePoint,PlaneNormal))>0.03 ||
+						FMath::Abs(FVector::DotProduct(B-PlanePoint,PlaneNormal))>0.03) continue;
+					Positions.Add(WeldKey(A),A); Positions.Add(WeldKey(B),B);
+					AddEdge(BodyEdges,WeldKey(A),WeldKey(B));
+				}
+		}
+		TMap<FIntVector,TArray<FIntVector>> Neighbors;
+		for (const auto& Pair : BodyEdges)
+			if (Pair.Value.Count==1)
+			{
+				Neighbors.FindOrAdd(Pair.Value.A).AddUnique(Pair.Value.B);
+				Neighbors.FindOrAdd(Pair.Value.B).AddUnique(Pair.Value.A);
+			}
+		const FProcMeshSection* Original=Mesh->GetProcMeshSection(CapIndex);
+		if (!Original) return false;
+		FProcMeshSection Cap=*Original;
+		for (int32 Pass=0; Pass<=Positions.Num(); ++Pass)
+		{
+			TMap<FString,FEdge> CapEdges; TSet<FIntVector> CapVertices;
+			for (int32 I=0; I+2<Cap.ProcIndexBuffer.Num(); I+=3)
+				for (int32 C=0; C<3; ++C)
+				{
+					const FIntVector A=WeldKey(Cap.ProcVertexBuffer[Cap.ProcIndexBuffer[I+C]].Position);
+					const FIntVector B=WeldKey(Cap.ProcVertexBuffer[Cap.ProcIndexBuffer[I+(C+1)%3]].Position);
+					CapVertices.Add(A); AddEdge(CapEdges,A,B);
+				}
+			bool Repaired=false;
+			for (const auto& Pair : CapEdges)
+			{
+				const FEdge& Edge=Pair.Value;
+				if (Edge.Count!=1) continue;
+				const TArray<FIntVector>* Starts=Neighbors.Find(Edge.A);
+				// Existing cuts can contain welded/T-junction boundaries. Only repair
+				// a chord when its exact side chain is unambiguous; otherwise retain
+				// the engine cap and let the existing full-solid validation decide.
+				if (!Starts || Starts->Num()!=2) continue;
+				if (Starts->Contains(Edge.B)) continue;
+				TArray<FIntVector> Chain;
+				for (const FIntVector& Start : *Starts)
+				{
+					TArray<FIntVector> Candidate; Candidate.Add(Edge.A);
+					FIntVector Previous=Edge.A,Current=Start;
+					while (Candidate.Num()<=Neighbors.Num())
+					{
+						Candidate.Add(Current);
+						if (Current==Edge.B) { Chain=MoveTemp(Candidate); break; }
+						if (CapVertices.Contains(Current)) break;
+						const TArray<FIntVector>* Next=Neighbors.Find(Current);
+						if (!Next || Next->Num()!=2) break;
+						const FIntVector Following=(*Next)[0]==Previous ? (*Next)[1] : (*Next)[0];
+						Previous=Current; Current=Following;
+					}
+					if (!Chain.IsEmpty()) break;
+				}
+				if (Chain.Num()<3) continue;
+				for (int32 I=0; I+2<Cap.ProcIndexBuffer.Num() && !Repaired; I+=3)
+					for (int32 C=0; C<3; ++C)
+					{
+						const uint32 U=Cap.ProcIndexBuffer[I+C],V=Cap.ProcIndexBuffer[I+(C+1)%3],W=Cap.ProcIndexBuffer[I+(C+2)%3];
+						const FIntVector A=WeldKey(Cap.ProcVertexBuffer[U].Position),B=WeldKey(Cap.ProcVertexBuffer[V].Position);
+						if (!((A==Edge.A && B==Edge.B) || (A==Edge.B && B==Edge.A))) continue;
+						if (A!=Chain[0]) Algo::Reverse(Chain);
+						const FProcMeshVertex First=Cap.ProcVertexBuffer[U],Last=Cap.ProcVertexBuffer[V];
+						const FVector Direction=Last.Position-First.Position;
+						TArray<uint32> Indices; Indices.Add(U);
+						for (int32 K=1; K+1<Chain.Num(); ++K)
+						{
+							FProcMeshVertex Vertex=First; Vertex.Position=Positions[Chain[K]];
+							const double T=FMath::Clamp(FVector::DotProduct(Vertex.Position-First.Position,Direction)/Direction.SizeSquared(),0.,1.);
+							Vertex.UV0=FMath::Lerp(First.UV0,Last.UV0,T);
+							Cap.SectionLocalBox+=Vertex.Position;
+							Indices.Add(Cap.ProcVertexBuffer.Add(Vertex));
+						}
+						Indices.Add(V); Cap.ProcIndexBuffer.RemoveAt(I,3,EAllowShrinking::No);
+						for (int32 K=1; K<Indices.Num(); ++K)
+						{ Cap.ProcIndexBuffer.Add(Indices[K-1]); Cap.ProcIndexBuffer.Add(Indices[K]); Cap.ProcIndexBuffer.Add(W); }
+						Repaired=true; break;
+					}
+				if (Repaired) break;
+			}
+			if (!Repaired) { Mesh->SetProcMeshSection(CapIndex,Cap); return true; }
+		}
+		return false;
 	}
 
 	bool GetTriangle(const FProcMeshSection& Section, int32 TriangleIndex,
@@ -370,6 +482,10 @@ namespace
 
 	void RebuildConvexCollision(UProceduralMeshComponent* Mesh)
 	{
+		// ProceduralMeshComponent disables this cook by default. Reflected pieces
+		// require it just as much as non-mirrored pieces require their normal cook.
+		if (Mesh->GetComponentTransform().GetDeterminant()<0)
+			if (UBodySetup* Body=Mesh->GetBodySetup()) Body->bGenerateMirroredCollision=true;
 		Mesh->ClearCollisionConvexMeshes();
 		const UTOLCutMeshData* Data=GetCutData(Mesh);
 		if (!Data) return;
@@ -946,6 +1062,12 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	UProceduralMeshComponent* OtherHalf=nullptr;
 	UKismetProceduralMeshLibrary::SliceProceduralMesh(Preview,WorldPlanePoint,KeepNormal,
 		true,OtherHalf,EProcMeshSliceCapOption::CreateNewSectionForCap,CapMaterial);
+	if (!OtherHalf || !RestoreCapBoundary(Preview,OriginalSections,PlaneLocal,KeepLocal) ||
+		!RestoreCapBoundary(OtherHalf,OtherHalf->GetNumSections()-1,PlaneLocal,KeepLocal))
+	{
+		if (OtherHalf) OtherHalf->DestroyComponent();
+		Preview->DestroyComponent(); return false;
+	}
 	const FProcMeshSection* KeptCap=Preview->GetProcMeshSection(OriginalSections);
 	const FProcMeshSection* OtherCap=OtherHalf ? OtherHalf->GetProcMeshSection(OtherHalf->GetNumSections()-1) : nullptr;
 	const bool Valid=KeptCap && OtherCap && !KeptCap->ProcIndexBuffer.IsEmpty() && !OtherCap->ProcIndexBuffer.IsEmpty();
