@@ -83,8 +83,14 @@ bool TOLCutValuation::Measure(const TArray<FProcMeshSection>& Sections,const FTr
 		Cuts.Sort([](const FCut& A,const FCut& B){return A.T<B.T;});
 		for (int32 I=1; I<Cuts.Num(); ++I) AddEdge(Split,Cuts[I-1].P,Cuts[I].P,E.Count,E.Balance);
 	}
+	int32 OpenEdges=0;
 	for (const auto& Pair : Split)
-		if (Pair.Value.Count!=2 || Pair.Value.Balance!=0) return Reject(TEXT("Open or inconsistently wound surface; value unchanged."));
+		if (Pair.Value.Count!=2 || Pair.Value.Balance!=0) ++OpenEdges;
+	if (OpenEdges)
+	{
+		OutError=FString::Printf(TEXT("Open or inconsistently wound surface (%d open edges)."),OpenEdges);
+		return false;
+	}
 	TSet<int32> Seen; double LocalVolume=0;
 	for (int32 Seed=0; Seed<Contributions.Num(); ++Seed)
 	{
@@ -102,5 +108,54 @@ bool TOLCutValuation::Measure(const TArray<FProcMeshSection>& Sections,const FTr
 	const double Volume=LocalVolume*Determinant/1000000.0; // cm^3 -> m^3
 	if (!FMath::IsFinite(Volume) || Volume<=1.e-12) return Reject(TEXT("Invalid solid volume."));
 	OutCubicMeters=Volume;
+	return true;
+}
+
+bool TOLCutValuation::MeasureTolerant(const TArray<FProcMeshSection>& Sections,const FTransform& Transform,
+	double& OutCubicMeters,FString& OutError)
+{
+	OutCubicMeters=0; OutError.Empty();
+	const FVector Scale=Transform.GetScale3D();
+	const double Determinant=FMath::Abs(Scale.X*Scale.Y*Scale.Z);
+	if (Transform.ContainsNaN() || !FMath::IsFinite(Determinant) || Determinant<=1.e-12)
+	{ OutError=TEXT("Volume requires a finite, nonzero mesh scale."); return false; }
+	// One signed sum over ALL triangles with a single reference point. Topology is deliberately ignored:
+	// a slicer cap that is not welded to the bark still closes the solid geometrically, so the sum is
+	// right; only real holes add an error, proportional to their area. All pieces of one tree share the
+	// same outward winding, so their volumes add up with the same sign.
+	TArray<FVector> Points;
+	for (const FProcMeshSection& S : Sections)
+		for (int32 T=0; T+2<S.ProcIndexBuffer.Num(); T+=3)
+		{
+			FVector P[3]; bool Ok=true;
+			for (int32 C=0; C<3 && Ok; ++C)
+			{
+				const uint32 I=S.ProcIndexBuffer[T+C];
+				Ok=I<uint32(S.ProcVertexBuffer.Num());
+				if (Ok) { P[C]=FVector(S.ProcVertexBuffer[I].Position); Ok=!P[C].ContainsNaN(); }
+			}
+			if (Ok) Points.Append(P,3);
+		}
+	if (Points.Num()<12) { OutError=TEXT("No solid to measure."); return false; }
+	FVector Origin=FVector::ZeroVector;
+	for (const FVector& P : Points) Origin+=P;
+	Origin/=double(Points.Num());
+	double SignedVolume=0;
+	for (int32 I=0; I<Points.Num(); I+=3)
+		SignedVolume+=FVector::DotProduct(Points[I]-Origin,FVector::CrossProduct(Points[I+1]-Origin,Points[I+2]-Origin))/6.0;
+	const double Volume=FMath::Abs(SignedVolume)*Determinant/1000000.0; // cm^3 -> m^3
+	if (!FMath::IsFinite(Volume) || Volume<=1.e-12) { OutError=TEXT("Invalid solid volume."); return false; }
+	OutCubicMeters=Volume;
+	return true;
+}
+
+bool TOLCutValuation::MeasureBest(const TArray<FProcMeshSection>& Sections,const FTransform& Transform,
+	double& OutCubicMeters,FString& OutError,bool& OutExact)
+{
+	OutExact=Measure(Sections,Transform,OutCubicMeters,OutError);
+	if (OutExact) return true;
+	const FString ExactError=OutError;
+	if (!MeasureTolerant(Sections,Transform,OutCubicMeters,OutError)) return false;
+	OutError=ExactError; // keep the reason the exact check failed, for logging
 	return true;
 }

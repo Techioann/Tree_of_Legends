@@ -8,9 +8,9 @@ public class Tree_of_Legends : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore" });
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "DeveloperSettings" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "ProceduralMeshComponent", "EnhancedInput" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "ProceduralMeshComponent", "EnhancedInput", "AssetRegistry", "PhysicsCore", "UMG" });
 		DynamicallyLoadedModuleNames.Add("OnlineSubsystemSteam");
 
 		// Uncomment if you are using Slate UI

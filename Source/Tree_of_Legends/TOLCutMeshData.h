@@ -123,6 +123,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Cutting|Validation")
 	bool ValidateTreeConfiguration(class UStaticMeshComponent* SourceTree, FString& OutError) const;
 
+	/** Segments a model would use once activated (authored, or detected from LOD 0). Empty if unreadable. */
+	static TArray<FTOLCutSegment> ComputeModelSegments(class UStaticMesh* Mesh, const FTOLTreeMeshConfiguration& Configuration);
+
 	bool EnsureSegments(class UProceduralMeshComponent* Mesh);
 	void MarkChopped() { bHasBeenChopped = true; }
 	void MarkGeometryModified() { bGeometryModified = true; bHasBeenChopped = true; }

@@ -9,7 +9,14 @@ bool UTOLCutMeshData::MeasureMeshVolume(UProceduralMeshComponent* Mesh,double& O
 	TArray<FProcMeshSection> Sections;
 	for (int32 S=0; S<Mesh->GetNumSections(); ++S)
 		if (const FProcMeshSection* Section=Mesh->GetProcMeshSection(S)) Sections.Add(*Section);
-	return TOLCutValuation::Measure(Sections,Mesh->GetComponentTransform(),OutVolumeM3,OutError);
+	// A tiny crack in an imported or sliced mesh must not leave a tree without value or mass (that made
+	// priced trees uncuttable): fall back to the tolerant measure and report why the exact one failed.
+	bool bExact=false;
+	if (!TOLCutValuation::MeasureBest(Sections,Mesh->GetComponentTransform(),OutVolumeM3,OutError,bExact)) return false;
+	if (!bExact)
+		UE_LOG(LogTemp, Verbose, TEXT("Cutting: approximate volume %.4f m3 for %s (%s)"),OutVolumeM3,*GetNameSafe(Mesh->GetOwner()),*OutError);
+	OutError.Empty();
+	return true;
 }
 
 bool UTOLCutMeshData::ConfigureValuation(int64 PricePerM3Minor,FString& OutError)
@@ -265,6 +272,13 @@ namespace
 		}
 		return Preview;
 	}
+}
+
+TArray<FTOLCutSegment> UTOLCutMeshData::ComputeModelSegments(UStaticMesh* Mesh, const FTOLTreeMeshConfiguration& Configuration)
+{
+	if (Configuration.SegmentMode==ETOLCutSegmentMode::Authored) return Configuration.AuthoredSegments;
+	if (!Mesh || !Mesh->bAllowCPUAccess || !Mesh->GetRenderData() || Mesh->GetNumLODs()<1) return {};
+	return DetectSegments(MakeModelPreview(GetTransientPackage(),Mesh));
 }
 
 bool UTOLCutMeshData::ValidateTreeConfiguration(UStaticMeshComponent* SourceTree, FString& OutError) const

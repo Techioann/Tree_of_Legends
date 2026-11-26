@@ -5,9 +5,11 @@
 #include "TOLCutMeshData.h"
 #include "TOLCutValuation.h"
 #include "TOLTreeActivationSubsystem.h"
+#include "TOLTreeLeafSubsystem.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "EngineUtils.h"
 
 #include "DrawDebugHelpers.h"
@@ -22,6 +24,12 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UnrealType.h"
+#include "TOLTreeRow.h"
+#include "TOLCutSettings.h"
+#include "HAL/IConsoleManager.h"
+#if WITH_EDITOR
+#include "AssetRegistry/IAssetRegistry.h"
+#endif
 
 namespace
 {
@@ -360,8 +368,9 @@ namespace
 	 * triangle stays intact, even when the infinite plane intersects another branch. */
 	bool SelectBranchCut(UProceduralMeshComponent* Mesh, int32 SegmentIndex,
 		const FVector& PlanePoint, const FVector& KeepNormal,
-		TArray<FProcMeshSection>& Selected, TArray<FProcMeshSection>& Remainder)
+		TArray<FProcMeshSection>& Selected, TArray<FProcMeshSection>& Remainder, FString& OutReason)
 	{
+		auto Fail=[&](FString Why){ OutReason=MoveTemp(Why); return false; };
 		struct FTriangle { int32 Section, Index; TArray<FVector> FarPolygon; };
 		TArray<FTriangle> Triangles;
 		TMap<FIntVector,TArray<int32>> Adjacency;
@@ -372,7 +381,7 @@ namespace
 			for (int32 T=0; T<Selected[S].ProcIndexBuffer.Num()/3; ++T)
 			{
 				FVector A,B,C;
-				if (!GetTriangle(Selected[S],T,A,B,C)) return false;
+				if (!GetTriangle(Selected[S],T,A,B,C)) return Fail(TEXT("invalid triangle"));
 				const FVector P[]={A,B,C};
 				FTriangle Triangle; Triangle.Section=S; Triangle.Index=T;
 				double Furthest=0.0;
@@ -403,7 +412,7 @@ namespace
 				}
 			}
 		}
-		if (Seed==INDEX_NONE || Best>25.0) return false;
+		if (Seed==INDEX_NONE || Best>25.0) return Fail(FString::Printf(TEXT("no far-side surface near the plane point (%.2f cm)"),Seed==INDEX_NONE ? -1.0 : FMath::Sqrt(Best)));
 		TSet<int32> Visited; Visited.Add(Seed);
 		TArray<int32> Queue; Queue.Add(Seed);
 		for (int32 I=0; I<Queue.Num(); ++I)
@@ -433,27 +442,29 @@ namespace
 				if (bCross && !Crossings.ContainsByPredicate([&](const FVector& V){return WeldKey(V)==WeldKey(Q);})) Crossings.Add(Q);
 			}
 			if (!bNear || !bFar) continue;
-			if (Crossings.Num()!=2) return false;
+			if (Crossings.Num()!=2) return Fail(FString::Printf(TEXT("triangle crosses the plane at %d points"),Crossings.Num()));
 			FVector Axis; int32 Owner=INDEX_NONE;
 			// A long junction triangle can cross this segment's plane while its
 			// centre still belongs to the trunk/sibling. Do not clip that shared face.
-			if (!FindLocalAxis(Mesh,(A+B+C)/3.0,KeepNormal,Axis,&Owner) || Owner!=SegmentIndex) return false;
-			if (!FindLocalAxis(Mesh,(Crossings[0]+Crossings[1])*0.5,KeepNormal,Axis,&Owner) || Owner!=SegmentIndex) return false;
+			if (!FindLocalAxis(Mesh,(A+B+C)/3.0,KeepNormal,Axis,&Owner) || Owner!=SegmentIndex)
+				return Fail(FString::Printf(TEXT("crossing triangle centre belongs to segment %d"),Owner));
+			if (!FindLocalAxis(Mesh,(Crossings[0]+Crossings[1])*0.5,KeepNormal,Axis,&Owner) || Owner!=SegmentIndex)
+				return Fail(FString::Printf(TEXT("boundary edge belongs to segment %d"),Owner));
 			const FIntVector X=WeldKey(Crossings[0]), Y=WeldKey(Crossings[1]);
-			if (X==Y) return false;
+			if (X==Y) return Fail(TEXT("degenerate boundary edge"));
 			Boundary.FindOrAdd(X).Add(Y); Boundary.FindOrAdd(Y).Add(X);
 		}
-		if (Boundary.Num()<3) return false;
+		if (Boundary.Num()<3) return Fail(FString::Printf(TEXT("boundary has only %d points"),Boundary.Num()));
 		TArray<FIntVector> Loop; TSet<FIntVector> Seen;
 		for (const auto& Entry : Boundary)
 		{
-			if (Entry.Value.Num()!=2) return false;
+			if (Entry.Value.Num()!=2) return Fail(FString::Printf(TEXT("boundary point with %d neighbours (open or branching loop)"),Entry.Value.Num()));
 			if (Loop.IsEmpty()) { Loop.Add(Entry.Key); Seen.Add(Entry.Key); }
 		}
 		for (int32 I=0; I<Loop.Num(); ++I)
 			for (const FIntVector& N : Boundary[Loop[I]])
 				if (!Seen.Contains(N)) { Seen.Add(N); Loop.Add(N); }
-		if (Seen.Num()!=Boundary.Num()) return false;
+		if (Seen.Num()!=Boundary.Num()) return Fail(FString::Printf(TEXT("boundary splits into several loops (%d of %d points in the first)"),Seen.Num(),Boundary.Num()));
 		TArray<TSet<int32>> Patch; Patch.SetNum(Selected.Num());
 		for (int32 I : Queue) Patch[Triangles[I].Section].Add(Triangles[I].Index);
 		for (int32 S=0; S<Selected.Num(); ++S)
@@ -538,6 +549,43 @@ namespace
 		return false;
 	}
 
+	// A non-zero profile price wins; otherwise the optional DT_Tree column "Price Per M3"
+	// (coins per cubic metre, Float or Integer) prices the tree. Returns 0 when neither is set.
+	int64 ResolveUnitPriceMinor(const FTOLDormantTreeProfile& Profile)
+	{
+		if (Profile.UnitPricePerM3Minor>0) return Profile.UnitPricePerM3Minor;
+		double Coins=0;
+		if (!ReadRowNumber(Profile.TreeData,TEXT("priceperm3"),Coins) || Coins<=0) return 0;
+		const double Minor=FMath::RoundToDouble(Coins*100.0);
+		if (Minor>double(TOLCutValuation::MaxMoney))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Cutting: DT_Tree row %s Price Per M3 is too large; tree left unpriced."),
+				*Profile.TreeData.RowName.ToString());
+			return 0;
+		}
+		return static_cast<int64>(Minor);
+	}
+
+	// Chaos derives mass from convex volume with the default material's 0.75 mass power,
+	// which makes a felled trunk ~10x lighter than wood. Pieces use real volume x density.
+	constexpr double DefaultWoodDensityKgM3=700.0;
+	void ApplyPhysicalMass(UProceduralMeshComponent* Mesh, const UTOLCutMeshData* Data)
+	{
+		if (!Mesh || !Data) return;
+		double Density=DefaultWoodDensityKgM3;
+		double RowDensity=0;
+		// Optional DT_Tree column "Density Kg M3" overrides the default per tree type.
+		if (ReadRowNumber(Data->TreeData,TEXT("densitykgm3"),RowDensity) && RowDensity>0) Density=RowDensity;
+		double VolumeM3=0; FString Error;
+		if (!UTOLCutMeshData::MeasureMeshVolume(Mesh,VolumeM3,Error) || !(VolumeM3>0))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Cutting: physical mass not applied to %s: %s"),*GetNameSafe(Mesh->GetOwner()),*Error);
+			return;
+		}
+		const float MassKg=static_cast<float>(FMath::Clamp(VolumeM3*Density,0.1,1.0e7));
+		Mesh->SetMassOverrideInKg(NAME_None,MassKg,true);
+	}
+
 	bool HasCutClearance(UProceduralMeshComponent* Mesh, int32 SegmentIndex,
 		const FVector& PlanePoint, const FVector& Axis, double MinimumLength)
 	{
@@ -560,6 +608,132 @@ namespace
 			}
 		}
 		return Min < -FMath::Max(MinimumLength,0.01) && Max > FMath::Max(MinimumLength,0.01);
+	}
+
+	struct FBranchCutPlan
+	{
+		TArray<FProcMeshSection> Selected, Remainder;
+		FVector PlaneWorld=FVector::ZeroVector, PlaneLocal=FVector::ZeroVector;
+		FVector KeepNormal=FVector::ZeroVector, KeepLocal=FVector::ZeroVector;
+		int32 SectionIndex=INDEX_NONE, HitSegment=INDEX_NONE;
+		double Shift=0.0;
+	};
+
+	/** Plans a cut through PlanePoint with normal PlaneNormal. If that exact plane has no single closed
+	 * boundary on the hit segment (typically right at a fork, where it would also catch the trunk or a
+	 * sibling branch), and bAllowShift is set, the nearest valid plane along the normal is used instead:
+	 * a few cm further along the branch the boundary is unambiguous. Without this a chop near a fork filled
+	 * up to 100% and then every further hit was rejected, so the tree could never be cut there. */
+	bool PlanBranchCut(UProceduralMeshComponent* Mesh, const FHitResult& Hit, const FVector& LocalHitPoint,
+		const FVector& PlanePoint, const FVector& PlaneNormal, const FVector& TrunkAxisLocal,
+		double MinimumPieceLength, bool bAllowShift, FBranchCutPlan& Out, FString& OutReason)
+	{
+		int32 TriangleIndex=INDEX_NONE;
+		if (!Mesh || !FindHitTriangle(Mesh,Hit.FaceIndex,LocalHitPoint,Out.SectionIndex,TriangleIndex))
+		{ OutReason=TEXT("hit triangle not found"); return false; }
+		UTOLCutMeshData* Data=GetCutData(Mesh);
+		FVector SegmentAxis;
+		if (!Data || Data->Segments.IsEmpty() || !FindLocalAxis(Mesh,LocalHitPoint,TrunkAxisLocal.GetSafeNormal(),SegmentAxis,&Out.HitSegment))
+		{ OutReason=TEXT("no tree segment at the hit"); return false; }
+		TArray<FProcMeshSection> Selected0, Remainder0;
+		ConnectedGeometry(Mesh,Out.SectionIndex,TriangleIndex,Selected0,Remainder0);
+		// Keep the root side. Centerline endpoints survive cuts and give a stable
+		// reference even when a branch is shorter than its cross-section.
+		FVector Root=Data->Segments[0].Start;
+		const FVector RootAxis=Data->GetTrunkAxis(TrunkAxisLocal);
+		for (const FTOLCutSegment& Segment : Data->Segments)
+			for (const FVector& P : {Segment.Start,Segment.End})
+				if (FVector::DotProduct(P,RootAxis)<FVector::DotProduct(Root,RootAxis)) Root=P;
+		const FTransform Transform=Mesh->GetComponentTransform();
+		const FVector RootWorld=Transform.TransformPosition(Root);
+		const FVector Normal=PlaneNormal.GetSafeNormal();
+		if (Normal.IsNearlyZero()) { OutReason=TEXT("invalid plane normal"); return false; }
+		FString ShiftReason; double ShiftReasonAt=0.0; bool bTooCloseToEnd=false;
+		auto Try=[&](double Shift)->bool
+		{
+			FVector Local=Transform.InverseTransformPosition(PlanePoint+Normal*Shift);
+			if (Shift!=0.0)
+			{
+				// Moving along the axis leaves the bark of a tapering branch; the plane point must stay on
+				// the hit island's surface for SelectBranchCut to find the cut patch.
+				double Best=TNumericLimits<double>::Max(); FVector Snapped=Local;
+				for (const FProcMeshSection& Section : Selected0)
+					for (int32 T=0; T<Section.ProcIndexBuffer.Num()/3; ++T)
+					{
+						FVector A,B,C;
+						if (!GetTriangle(Section,T,A,B,C)) continue;
+						const FVector Q=FMath::ClosestPointOnTriangleToPoint(Local,A,B,C);
+						const double D=FVector::DistSquared(Q,Local);
+						if (D<Best) { Best=D; Snapped=Q; }
+					}
+				Local=Snapped;
+			}
+			const FVector World=Transform.TransformPosition(Local);
+			auto Reject=[&](const FString& Why)
+			{
+				if (Shift==0.0) OutReason=Why;
+				else if (ShiftReason.IsEmpty()) { ShiftReason=Why; ShiftReasonAt=Shift; }
+				return false;
+			};
+			if (!HasCutClearance(Mesh,Out.HitSegment,Local,SegmentAxis,MinimumPieceLength))
+			{
+				if (Shift==0.0) bTooCloseToEnd=true;
+				return Reject(TEXT("too close to the end of the piece"));
+			}
+			const FVector Keep=FVector::DotProduct(RootWorld-World,Normal)>=0.0 ? Normal : -Normal;
+			const FVector KeepLocal=(Transform.GetScale3D()*Transform.InverseTransformVectorNoScale(Keep)).GetSafeNormal();
+			TArray<FProcMeshSection> Selected=Selected0, Remainder=Remainder0;
+			FString Reason;
+			if (!SelectBranchCut(Mesh,Out.HitSegment,Local,KeepLocal,Selected,Remainder,Reason)) return Reject(Reason);
+			Out.Selected=MoveTemp(Selected); Out.Remainder=MoveTemp(Remainder);
+			Out.PlaneWorld=World; Out.PlaneLocal=Local; Out.KeepNormal=Keep; Out.KeepLocal=KeepLocal;
+			Out.Shift=FVector::DotProduct(World-PlanePoint,Normal);
+			if (Shift!=0.0 && FMath::IsNearlyZero(Out.Shift,0.01)) Out.Shift=Shift;
+			return true;
+		};
+		if (Try(0.0)) return true;
+		if (!bAllowShift) return false;
+		// Shifting is for forks only. A hit next to a real end of the piece, typically the cap of the cut
+		// just completed while the player keeps clicking the same spot, must stay rejected; moving it would
+		// slice off a thin disc per extra click. Per-segment clearance also fails right at a fork (the
+		// branch's own triangles start a bit further out), so tell them apart by the cut caps: every cut
+		// stores its cap as its own, perfectly flat mesh section (bark sections never are), so a flat
+		// section across this branch within the minimum piece length means the hit is next to a cut end.
+		if (bTooCloseToEnd)
+		{
+			const FVector LineA=Transform.TransformPosition(Data->Segments[Out.HitSegment].Start);
+			const FVector LineB=Transform.TransformPosition(Data->Segments[Out.HitSegment].End);
+			const double HitRadius=FVector::Dist(PlanePoint,FMath::ClosestPointOnInfiniteLine(LineA,LineB,PlanePoint));
+			const double Reach=FMath::Max(MinimumPieceLength,0.01)+1.0;
+			for (const FProcMeshSection& Section : Selected0)
+			{
+				if (Section.ProcIndexBuffer.Num()<3 || Section.ProcVertexBuffer.IsEmpty()) continue;
+				FVector A,B,C,FaceNormal=FVector::ZeroVector;
+				for (int32 T=0; T<Section.ProcIndexBuffer.Num()/3 && FaceNormal.IsNearlyZero(); ++T)
+					if (GetTriangle(Section,T,A,B,C))
+						FaceNormal=FVector::CrossProduct(Transform.TransformPosition(B)-Transform.TransformPosition(A),
+							Transform.TransformPosition(C)-Transform.TransformPosition(A)).GetSafeNormal();
+				if (FaceNormal.IsNearlyZero() || FMath::Abs(FVector::DotProduct(FaceNormal,Normal))<0.95) continue;
+				const FVector Origin=Transform.TransformPosition(A);
+				bool bFlat=true, bNearHit=false;
+				for (const FProcMeshVertex& Vertex : Section.ProcVertexBuffer)
+				{
+					const FVector P=Transform.TransformPosition(FVector(Vertex.Position));
+					if (FMath::Abs(FVector::DotProduct(P-Origin,FaceNormal))>0.5) { bFlat=false; break; }
+					bNearHit|=FMath::Abs(FVector::DotProduct(P-PlanePoint,Normal))<=Reach &&
+						FVector::Dist(P,FMath::ClosestPointOnInfiniteLine(LineA,LineB,P))<=HitRadius*1.5+1.0;
+				}
+				if (bFlat && bNearHit) return false;
+			}
+		}
+		const FTOLCutSegment& Segment=Data->Segments[Out.HitSegment];
+		const double Length=FVector::Dist(Transform.TransformPosition(Segment.Start),Transform.TransformPosition(Segment.End));
+		const double MaxShift=FMath::Max(Length*0.5,2.0), Step=FMath::Clamp(Length/40.0,0.5,5.0);
+		for (double Distance=Step; Distance<=MaxShift+KINDA_SMALL_NUMBER; Distance+=Step)
+			if (Try(Distance) || Try(-Distance)) return true;
+		if (!ShiftReason.IsEmpty())
+			OutReason+=FString::Printf(TEXT("; moved %.1f cm: %s"),ShiftReasonAt,*ShiftReason);
+		return false;
 	}
 
 	void RefreshCutMarks(UProceduralMeshComponent* Mesh, UTOLCutMeshData* Data, UMaterialInterface* Material)
@@ -631,42 +805,269 @@ namespace
 UTOLCutTraceComponent::UTOLCutTraceComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
-	static ConstructorHelpers::FObjectFinder<UDataTable> Axes(TEXT("/Game/Blueprints/BPStructure/DT_Axe.DT_Axe"));
-	static ConstructorHelpers::FObjectFinder<UDataTable> Trees(TEXT("/Game/Blueprints/BPStructure/DT_Tree.DT_Tree"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> Mark(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
-	AxeData.DataTable=Axes.Object; AxeData.RowName=TEXT("Wa");
-	DefaultTreeData.DataTable=Trees.Object; DefaultTreeData.RowName=TEXT("Tree_Birch");
+	// Tables stay empty here: they come from the owner (B_Character) or UTOLCutSettings at BeginPlay,
+	// so moving Content no longer breaks the CDO. Trees come from DT_Tree rows; no hard-coded meshes.
+	AxeData.RowName=TEXT("Wa");
+	DefaultTreeData.RowName=TEXT("Tree_Wood");
 	CutMarkMaterial=Mark.Object;
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> Wood(TEXT("/Game/Meshes/SM_Tree_Wood.SM_Tree_Wood"));
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> Iron(TEXT("/Game/Meshes/SM_Tree_Iron.SM_Tree_Iron"));
-	FTOLDormantTreeProfile WoodProfile;
-	WoodProfile.Model.Mesh=Wood.Object;
-	WoodProfile.TreeData=DefaultTreeData;
-	DormantTreeProfiles.Add(WoodProfile);
-	FTOLDormantTreeProfile IronProfile;
-	IronProfile.Model.Mesh=Iron.Object;
-	IronProfile.Model.SegmentMode=ETOLCutSegmentMode::Authored;
-	IronProfile.TreeData.DataTable=Trees.Object;
-	IronProfile.TreeData.RowName=TEXT("Tree_Iron");
-	DormantTreeProfiles.Add(IronProfile);
 }
+
+void UTOLCutTraceComponent::ResolveDefaultTables()
+{
+	const UTOLCutSettings* Settings=GetDefault<UTOLCutSettings>();
+	if (!AxeData.DataTable) AxeData.DataTable=UTOLCutSettings::ResolveTable(Settings->AxeTable);
+	if (!DefaultTreeData.DataTable) DefaultTreeData.DataTable=UTOLCutSettings::ResolveTable(Settings->TreeTable);
+	if (AxeData.DataTable && AxeData.DataTable->FindRowUnchecked(AxeData.RowName)) return;
+	const FString Message=FString::Printf(TEXT("Cutting disabled on %s: axe row %s in %s not found (CutTrace AxeData / Project Settings > Game > Tree of Legends Cutting)."),
+		*GetNameSafe(GetOwner()),*AxeData.RowName.ToString(),*GetNameSafe(AxeData.DataTable));
+	UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+	if (GEngine) GEngine->AddOnScreenDebugMessage(-1,15.f,FColor::Red,Message);
+}
+
+namespace
+{
+	const TCHAR* const TreeMeshPrefix=TEXT("SM_Tree_");
+	const TCHAR* const TreeRowPrefix=TEXT("Tree_");
+
+	bool IsTreeRowTable(const UDataTable* Table)
+	{
+		return Table && Table->GetRowStruct() && Table->GetRowStruct()->IsChildOf(FTOLTreeRow::StaticStruct());
+	}
+
+	// "SM_Tree_Oak" -> "Tree_Oak"; NAME_None for meshes outside the naming convention.
+	FName ConventionRowName(const FString& MeshName)
+	{
+		if (!MeshName.StartsWith(TreeMeshPrefix,ESearchCase::CaseSensitive) || MeshName.Len()<=FCString::Strlen(TreeMeshPrefix))
+			return NAME_None;
+		return FName(FString(TreeRowPrefix)+MeshName.RightChop(FCString::Strlen(TreeMeshPrefix)));
+	}
+}
+
+UDataTable* UTOLCutTraceComponent::GetTreeTable() const
+{
+	// Row handles store const tables; the editor sync is the only writer.
+	if (TreeTable) return TreeTable.Get();
+	if (DefaultTreeData.DataTable) return const_cast<UDataTable*>(DefaultTreeData.DataTable.Get());
+	return UTOLCutSettings::ResolveTable(GetDefault<UTOLCutSettings>()->TreeTable);
+}
+
+int32 UTOLCutTraceComponent::FindTreeProfileIndex(const UStaticMesh* Mesh) const
+{
+	if (!Mesh) return INDEX_NONE;
+	int32 Found=INDEX_NONE;
+	for (int32 I=0; I<DormantTreeProfiles.Num(); ++I)
+	{
+		if (DormantTreeProfiles[I].Model.Mesh!=Mesh) continue;
+		if (Found!=INDEX_NONE) return INDEX_NONE; // Ambiguous configuration must not select arbitrary material data.
+		Found=I;
+	}
+	return Found;
+}
+
+int32 UTOLCutTraceComponent::ResolveTreeProfileIndex(const UStaticMesh* Mesh)
+{
+	if (!Mesh) return INDEX_NONE;
+	if (DormantTreeProfiles.ContainsByPredicate([&](const FTOLDormantTreeProfile& P) { return P.Model.Mesh==Mesh; }))
+		return FindTreeProfileIndex(Mesh);
+	if (NonTreeMeshes.Contains(TObjectKey<UStaticMesh>(Mesh))) return INDEX_NONE;
+	FTOLDormantTreeProfile Profile;
+	if (!BuildProfileFromTable(const_cast<UStaticMesh*>(Mesh),Profile))
+	{
+		NonTreeMeshes.Add(TObjectKey<UStaticMesh>(Mesh));
+		return INDEX_NONE;
+	}
+	return DormantTreeProfiles.Add(MoveTemp(Profile));
+}
+
+bool UTOLCutTraceComponent::FindTreeModel(UStaticMesh* Mesh, FTOLTreeMeshConfiguration& OutModel) const
+{
+	const int32 Index=FindTreeProfileIndex(Mesh);
+	if (Index!=INDEX_NONE) { OutModel=DormantTreeProfiles[Index].Model; return true; }
+	FTOLDormantTreeProfile Profile;
+	if (!Mesh || !BuildProfileFromTable(Mesh,Profile)) return false;
+	OutModel=Profile.Model;
+	return true;
+}
+
+bool UTOLCutTraceComponent::BuildProfileFromTable(UStaticMesh* Mesh, FTOLDormantTreeProfile& OutProfile) const
+{
+	UDataTable* Table=GetTreeTable();
+	if (!Mesh || !Table) return false;
+	const bool bTyped=IsTreeRowTable(Table);
+	FName RowName=NAME_None;
+	const TCHAR* How=TEXT("Mesh column");
+	if (bTyped)
+	{
+		// 1. A row whose Mesh column names this exact asset.
+		const FSoftObjectPath Path(Mesh);
+		for (const TPair<FName,uint8*>& Pair : Table->GetRowMap())
+		{
+			if (reinterpret_cast<const FTOLTreeRow*>(Pair.Value)->Mesh.ToSoftObjectPath()!=Path) continue;
+			if (!RowName.IsNone())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Cutting: %s is the Mesh of both %s rows %s and %s; tree disabled."),
+					*Mesh->GetName(),*Table->GetName(),*RowName.ToString(),*Pair.Key.ToString());
+				return false;
+			}
+			RowName=Pair.Key;
+		}
+	}
+	const FName Convention=ConventionRowName(Mesh->GetName());
+	if (RowName.IsNone() && !Convention.IsNone())
+	{
+		// 2. Naming convention, only for rows not already claimed by another mesh.
+		const uint8* const* Row=Table->GetRowMap().Find(Convention);
+		if (Row && (!bTyped || reinterpret_cast<const FTOLTreeRow*>(*Row)->Mesh.IsNull()))
+		{
+			RowName=Convention; How=TEXT("name");
+		}
+	}
+	FDataTableRowHandle Handle;
+	if (!RowName.IsNone()) { Handle.DataTable=Table; Handle.RowName=RowName; }
+	else if (!Convention.IsNone() && DefaultTreeData.DataTable && !DefaultTreeData.RowName.IsNone())
+	{
+		// 3. A new SM_Tree_* mesh without a row stays playable on default values.
+		UE_LOG(LogTemp, Warning, TEXT("Cutting: no %s row for %s (expected %s); using default row %s. Run TOL.SyncTreeTable in the editor."),
+			*Table->GetName(),*Mesh->GetName(),*Convention.ToString(),*DefaultTreeData.RowName.ToString());
+		Handle=DefaultTreeData; How=TEXT("default fallback");
+	}
+	else return false;
+
+	OutProfile=FTOLDormantTreeProfile();
+	OutProfile.Model.Mesh=Mesh;
+	OutProfile.Model.TrunkAxisLocal=TrunkAxisLocal;
+	OutProfile.TreeData=Handle;
+	if (IsTreeRowTable(Handle.DataTable))
+		if (const FTOLTreeRow* Row=Handle.DataTable->FindRow<FTOLTreeRow>(Handle.RowName,TEXT("Cutting")))
+		{
+			OutProfile.ResistanceMultiplier=FMath::Max(Row->ResistanceMultiplier,0.001);
+			// A fallback row's authored segments belong to a different mesh.
+			if (Handle.RowName==RowName)
+			{
+				OutProfile.Model.SegmentMode=Row->SegmentMode;
+				OutProfile.Model.AuthoredSegments=Row->AuthoredSegments;
+			}
+			if (!Row->TrunkAxisLocal.IsNearlyZero()) OutProfile.Model.TrunkAxisLocal=Row->TrunkAxisLocal;
+		}
+	UE_LOG(LogTemp, Display, TEXT("Cutting: %s -> %s row %s (by %s)."),
+		*Mesh->GetName(),*GetNameSafe(Handle.DataTable),*Handle.RowName.ToString(),How);
+	return true;
+}
+
+void UTOLCutTraceComponent::SyncTreeTable()
+{
+	const int32 Changed=SyncTreeTableWithMeshes(GetTreeTable(),DefaultTreeData.RowName);
+	if (Changed>0) NonTreeMeshes.Reset();
+}
+
+int32 UTOLCutTraceComponent::SyncTreeTableWithMeshes(UDataTable* Table, FName TemplateRow)
+{
+#if WITH_EDITOR
+	if (!IsTreeRowTable(Table))
+	{
+		UE_LOG(LogTemp, Error, TEXT("TOL.SyncTreeTable: %s does not use the FTOLTreeRow row type."),*GetNameSafe(Table));
+		return -1;
+	}
+	IAssetRegistry* Registry=IAssetRegistry::Get();
+	if (!Registry) return -1;
+	TArray<FAssetData> Meshes;
+	Registry->GetAssetsByClass(UStaticMesh::StaticClass()->GetClassPathName(),Meshes);
+	Meshes.Sort([](const FAssetData& A, const FAssetData& B) { return A.PackageName.LexicalLess(B.PackageName); });
+	const FTOLTreeRow* Template=Table->FindRow<FTOLTreeRow>(TemplateRow,TEXT("TOL.SyncTreeTable"),false);
+	int32 Added=0, Linked=0;
+	for (const FAssetData& Asset : Meshes)
+	{
+		const FString Package=Asset.PackageName.ToString();
+		const FName RowName=ConventionRowName(Asset.AssetName.ToString());
+		if (RowName.IsNone() || !Package.StartsWith(TEXT("/Game/")) || Package.StartsWith(TEXT("/Game/_Archive/"))) continue;
+		const FSoftObjectPath Path=Asset.GetSoftObjectPath();
+		bool bReferenced=false;
+		for (const TPair<FName,uint8*>& Pair : Table->GetRowMap())
+			bReferenced|=reinterpret_cast<const FTOLTreeRow*>(Pair.Value)->Mesh.ToSoftObjectPath()==Path;
+		if (bReferenced) continue;
+		if (FTOLTreeRow* Existing=Table->FindRow<FTOLTreeRow>(RowName,TEXT("TOL.SyncTreeTable"),false))
+		{
+			if (!Existing->Mesh.IsNull())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("TOL.SyncTreeTable: row %s already uses %s; %s left unassigned."),
+					*RowName.ToString(),*Existing->Mesh.ToString(),*Path.ToString());
+				continue;
+			}
+			Table->Modify();
+			Existing->Mesh=TSoftObjectPtr<UStaticMesh>(Path);
+			++Linked;
+			UE_LOG(LogTemp, Display, TEXT("TOL.SyncTreeTable: linked %s to row %s."),*Path.ToString(),*RowName.ToString());
+			continue;
+		}
+		FTOLTreeRow Row=Template ? *Template : FTOLTreeRow();
+		Row.DisplayName=FText::FromString(Asset.AssetName.ToString().RightChop(FCString::Strlen(TreeMeshPrefix)));
+		Row.Mesh=TSoftObjectPtr<UStaticMesh>(Path);
+		Row.SegmentMode=ETOLCutSegmentMode::Automatic;
+		Row.AuthoredSegments.Reset();
+		Row.TrunkAxisLocal=FVector::UpVector;
+		Table->Modify();
+		Table->AddRow(RowName,Row);
+		++Added;
+		UE_LOG(LogTemp, Display, TEXT("TOL.SyncTreeTable: added row %s for %s (values copied from %s)."),
+			*RowName.ToString(),*Path.ToString(),Template ? *TemplateRow.ToString() : TEXT("defaults"));
+	}
+	if (Added+Linked>0)
+	{
+		Table->HandleDataTableChanged();
+		Table->MarkPackageDirty();
+	}
+	UE_LOG(LogTemp, Display, TEXT("TOL.SyncTreeTable: %s - %d row(s) added, %d linked. Save the table to keep them."),
+		*Table->GetName(),Added,Linked);
+	return Added+Linked;
+#else
+	return -1;
+#endif
+}
+
+#if WITH_EDITOR
+static FAutoConsoleCommand GTOLSyncTreeTableCommand(
+	TEXT("TOL.SyncTreeTable"),
+	TEXT("Adds DT_Tree rows Tree_<X> for SM_Tree_<X> meshes that have none and fills empty Mesh columns."),
+	FConsoleCommandDelegate::CreateLambda([]()
+	{
+		const UTOLCutTraceComponent* Defaults=GetDefault<UTOLCutTraceComponent>();
+		UTOLCutTraceComponent::SyncTreeTableWithMeshes(Defaults->GetTreeTable(),Defaults->DefaultTreeData.RowName);
+	}));
+#endif
 
 void UTOLCutTraceComponent::BeginPlay()
 {
 	Super::BeginPlay();
+	ResolveDefaultTables();
 	UWorld* World=GetWorld();
-	if (!World || !World->IsGameWorld() || DormantTreeProfiles.IsEmpty()) return;
+	if (!World || !World->IsGameWorld() || (DormantTreeProfiles.IsEmpty() && !GetTreeTable())) return;
 	UTOLTreeActivationSubsystem* Registry=World->GetSubsystem<UTOLTreeActivationSubsystem>();
 	if (!Registry || !Registry->PrepareDormantTreesOnce()) return;
-	// One lightweight pass: no procedural meshes, per-tree components or ticking manager.
+	UTOLTreeLeafSubsystem* Leaves=World->GetSubsystem<UTOLTreeLeafSubsystem>();
+	// One lightweight pass: no procedural meshes or ticking manager; leaves are one instanced component per tree.
 	for (TActorIterator<AStaticMeshActor> It(World); It; ++It)
 	{
 		UStaticMeshComponent* Source=It->GetStaticMeshComponent();
-		if (!Source || !DormantTreeProfiles.ContainsByPredicate([&](const FTOLDormantTreeProfile& Profile)
-			{ return Profile.Model.Mesh && Profile.Model.Mesh==Source->GetStaticMesh(); })) continue;
+		const int32 ProfileIndex=Source ? ResolveTreeProfileIndex(Source->GetStaticMesh()) : INDEX_NONE;
+		if (ProfileIndex==INDEX_NONE) continue;
 		Source->SetSimulatePhysics(false);
 		Source->SetComponentTickEnabled(false);
 		It->SetActorTickEnabled(false);
+		if (Leaves) Leaves->AddDormantLeaves(Source,FTOLTreeMeshConfiguration(DormantTreeProfiles[ProfileIndex].Model));
+	}
+	if (!Leaves) return;
+	// Foliage-painted trees: one leaf component per foliage component, covering all its instances.
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		TInlineComponentArray<UInstancedStaticMeshComponent*> Components(*It);
+		for (UInstancedStaticMeshComponent* Instances : Components)
+		{
+			if (Instances->ComponentHasTag(UTOLTreeLeafSubsystem::LeafTag)) continue;
+			const int32 ProfileIndex=ResolveTreeProfileIndex(Instances->GetStaticMesh());
+			if (ProfileIndex!=INDEX_NONE)
+				Leaves->AddDormantLeaves(Instances,FTOLTreeMeshConfiguration(DormantTreeProfiles[ProfileIndex].Model));
+		}
 	}
 }
 
@@ -777,15 +1178,9 @@ bool UTOLCutTraceComponent::EquipAxe(FDataTableRowHandle Row, double RemainingDu
 bool UTOLCutTraceComponent::SetDormantTreeUnitPrice(UStaticMesh* Model,int64 PricePerM3Minor)
 {
 	if (!Model || PricePerM3Minor<0 || PricePerM3Minor>TOLCutValuation::MaxMoney) return false;
-	FTOLDormantTreeProfile* Match=nullptr;
-	for (FTOLDormantTreeProfile& Profile : DormantTreeProfiles)
-	{
-		if (Profile.Model.Mesh!=Model) continue;
-		if (Match) return false;
-		Match=&Profile;
-	}
-	if (!Match) return false;
-	Match->UnitPricePerM3Minor=PricePerM3Minor;
+	const int32 Index=ResolveTreeProfileIndex(Model);
+	if (Index==INDEX_NONE) return false;
+	DormantTreeProfiles[Index].UnitPricePerM3Minor=PricePerM3Minor;
 	return true;
 }
 
@@ -823,11 +1218,16 @@ bool UTOLCutTraceComponent::ApplyTreeHit(const FHitResult& Hit, FTOLCutTraceResu
 
 bool UTOLCutTraceComponent::TryActivateTree(const FHitResult& Hit, FTOLCutTraceResult& OutTrace, FTOLChopResult& OutChop)
 {
-	AStaticMeshActor* Original=Cast<AStaticMeshActor>(Hit.GetActor());
-	UStaticMeshComponent* Source=Original ? Original->GetStaticMeshComponent() : nullptr;
+	// Dormant trees are either placed Static Mesh Actors or instances painted with the Foliage tool
+	// (UFoliageInstancedStaticMeshComponent derives from UInstancedStaticMeshComponent; Hit.Item = instance).
+	UInstancedStaticMeshComponent* Instances=Cast<UInstancedStaticMeshComponent>(Hit.GetComponent());
+	const int32 InstanceIndex=Instances ? Hit.Item : INDEX_NONE;
+	AStaticMeshActor* Original=Instances ? nullptr : Cast<AStaticMeshActor>(Hit.GetActor());
+	UStaticMeshComponent* Source=Instances ? Instances : (Original ? Original->GetStaticMeshComponent() : nullptr);
 	UWorld* World=GetWorld();
 	if (!Hit.bBlockingHit || !World || !Source || Source!=Hit.GetComponent() ||
 		Source->GetWorld()!=World || Hit.ImpactPoint.ContainsNaN() || !CuttableTreeClass) return false;
+	if (Instances && !Instances->IsValidInstance(InstanceIndex)) return false;
 	UTOLTreeActivationSubsystem* Registry=World->GetSubsystem<UTOLTreeActivationSubsystem>();
 	if (!Registry) return false;
 	auto RemapHit=[&](AActor* Actor, UProceduralMeshComponent* Mesh)
@@ -838,23 +1238,23 @@ bool UTOLCutTraceComponent::TryActivateTree(const FHitResult& Hit, FTOLCutTraceR
 		return Contact;
 	};
 	// A stale reference to the hidden source routes to its existing active body.
-	if (AActor* Active=Registry->GetActiveTree(Source))
+	// Foliage instances are removed on activation instead, so they never have a registry entry.
+	if (AActor* Active=Instances ? nullptr : Registry->GetActiveTree(Source))
 	{
 		UTOLCutMeshData* Data=Active->FindComponentByClass<UTOLCutMeshData>();
 		UProceduralMeshComponent* Mesh=Data ? Data->GetBoundMesh() : nullptr;
 		return Data && Mesh && ComputeCutPlaneFromHit(RemapHit(Active,Mesh),OutTrace) && ApplyChop(OutTrace,OutChop);
 	}
-	if (!Source->IsVisible() || Source->bHiddenInGame || Original->IsHidden()) return false;
-	const FTOLDormantTreeProfile* Profile=nullptr;
-	for (const FTOLDormantTreeProfile& Entry : DormantTreeProfiles)
-	{
-		if (!Entry.Model.Mesh || Entry.Model.Mesh!=Source->GetStaticMesh()) continue;
-		if (Profile) return false; // Ambiguous configuration must not select arbitrary material data.
-		Profile=&Entry;
-	}
+	if (!Source->IsVisible() || Source->bHiddenInGame || (Original && Original->IsHidden())) return false;
+	const int32 ProfileIndex=ResolveTreeProfileIndex(Source->GetStaticMesh());
+	if (ProfileIndex==INDEX_NONE) return false;
+	// Copy: spawning below may run Blueprint code that resolves more profiles and grows the array.
+	const FTOLDormantTreeProfile ProfileCopy=DormantTreeProfiles[ProfileIndex];
+	const FTOLDormantTreeProfile* Profile=&ProfileCopy;
 	double Gain=0.0, Wear=0.0, Health=0.0;
 	if (!Profile || !CalculateChopValues(Profile->TreeData,Profile->ResistanceMultiplier,Gain,Wear,Health)) return false;
-	const FTransform Transform=Source->GetComponentTransform();
+	FTransform Transform=Source->GetComponentTransform();
+	if (Instances && !Instances->GetInstanceTransform(InstanceIndex,Transform,/*bWorldSpace=*/true)) return false;
 	const FVector Scale=Transform.GetScale3D();
 	if (Transform.ContainsNaN() || FMath::IsNearlyZero(Scale.X) || FMath::IsNearlyZero(Scale.Y) ||
 		FMath::IsNearlyZero(Scale.Z) || !Registry->BeginActivation(Source)) return false;
@@ -874,7 +1274,7 @@ bool UTOLCutTraceComponent::TryActivateTree(const FHitResult& Hit, FTOLCutTraceR
 	if (!Candidate) return Rollback();
 	Candidate->SetActorHiddenInGame(true);
 	Candidate->SetActorEnableCollision(false);
-	Candidate->Tags=Original->Tags;
+	if (Original) Candidate->Tags=Original->Tags;
 	Candidate->FinishSpawning(Transform,false,nullptr,ESpawnActorScaleMethod::OverrideRootScale);
 	UTOLCutMeshData* Data=Candidate->FindComponentByClass<UTOLCutMeshData>();
 	UStaticMeshComponent* CandidateSource=Candidate->FindComponentByClass<UStaticMeshComponent>();
@@ -886,18 +1286,34 @@ bool UTOLCutTraceComponent::TryActivateTree(const FHitResult& Hit, FTOLCutTraceR
 	if (!Data->ConfigureModel(Profile->Model,CandidateSource,Mesh,Error) ||
 		!Mesh->GetComponentTransform().Equals(Transform,0.01) ||
 		!ComputeCutPlaneFromHit(RemapHit(Candidate,Mesh),OutTrace)) return Rollback();
-	if (!Data->ConfigureValuation(Profile->UnitPricePerM3Minor,Error) && Profile->UnitPricePerM3Minor!=0) return Rollback();
+	const int64 UnitPriceMinor=ResolveUnitPriceMinor(*Profile);
+	if (!Data->ConfigureValuation(UnitPriceMinor,Error) && UnitPriceMinor!=0) return Rollback();
+	// Before the first chop, so a one-hit fell already carries leaves onto its fragment.
+	// They are owned by Candidate / the fragment, so Rollback destroys them too.
+	UTOLTreeLeafSubsystem* Leaves=World->GetSubsystem<UTOLTreeLeafSubsystem>();
+	if (Leaves) Leaves->SpawnLeaves(Mesh,Profile->Model);
 	{
 		// Publish notifications only after committing, so callbacks cannot observe a half-activated tree.
 		TGuardValue<bool> Deferred(bDeferChopNotifications,true);
 		if (!ApplyChop(OutTrace,OutChop) || OutChop.ProgressGain<=0.0) return Rollback();
 	}
-	if (!Registry->CommitActivation(Source,Candidate)) return Rollback();
 	// The original stays intact and visible until conversion AND the first chop both succeed.
-	Source->SetSimulatePhysics(false);
-	Source->SetVisibility(false,true);
-	Source->SetHiddenInGame(true,true);
-	Source->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	if (Instances)
+	{
+		// Instance indices are not stable (removal swaps), so removing the instance is the commit;
+		// the lock is only held for the duration of this synchronous activation.
+		if (!Instances->RemoveInstance(InstanceIndex)) return Rollback();
+		Registry->AbortActivation(Source);
+		if (Leaves) Leaves->RemoveDormantInstanceLeaves(Instances,Transform,Profile->Model);
+	}
+	else
+	{
+		if (!Registry->CommitActivation(Source,Candidate)) return Rollback();
+		Source->SetSimulatePhysics(false);
+		Source->SetVisibility(false,true);
+		Source->SetHiddenInGame(true,true);
+		Source->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
 	Candidate->SetActorHiddenInGame(false);
 	Candidate->SetActorEnableCollision(true);
 	// While actor collision was disabled, SetCollisionEnabled(NoCollision) could early-out
@@ -946,7 +1362,45 @@ bool UTOLCutTraceComponent::ApplyChop(const FTOLCutTraceResult& Cut, FTOLChopRes
 			Transform.TransformPosition(Active.LocalPlanePoint),WorldAxis));
 		if (Distance<=Nearest) { Nearest=Distance; CutIndex=I; }
 	}
-	const FVector PlanePoint=CutIndex==INDEX_NONE ? Current.LocalHitPoint : Data->ActiveCuts[CutIndex].LocalPlanePoint;
+	FVector PlanePoint=CutIndex==INDEX_NONE ? Current.LocalHitPoint : Data->ActiveCuts[CutIndex].LocalPlanePoint;
+	if (CutIndex==INDEX_NONE)
+	{
+		// Validate a new cut before any progress is spent on it. Near a fork the exact hit plane can be
+		// impossible to cut cleanly; start the groove at the nearest position along the branch that is.
+		FBranchCutPlan Plan; FString Reason;
+		if (!PlanBranchCut(Mesh,Current.Hit,Current.LocalHitPoint,Transform.TransformPosition(Current.LocalHitPoint),
+			Current.WorldPlaneNormal,TrunkAxisLocal,MinimumPieceLength,/*bAllowShift=*/true,Plan,Reason))
+		{
+			// Hitting next to a fresh cap is normal play (extra clicks after a cut), not worth a log line.
+			if (Reason.StartsWith(TEXT("too close")))
+			{
+				UE_LOG(LogTemp, Verbose, TEXT("Cutting: hit on %s too close to the end of the piece; ignored."),*GetNameSafe(Mesh->GetOwner()));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Display, TEXT("Cutting: no cuttable position near the hit on %s, segment %d: %s"),
+					*GetNameSafe(Mesh->GetOwner()),Segment,*Reason);
+			}
+			return Finish(false);
+		}
+		PlanePoint=Plan.PlaneLocal;
+		if (Plan.Shift!=0.0)
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("Cutting: new cut on %s moved %.1f cm along segment %d (%s at the hit)."),
+				*GetNameSafe(Mesh->GetOwner()),Plan.Shift,Segment,*Reason);
+			// The moved groove may coincide with one already in progress: keep chopping that one.
+			double Merge=FMath::Max(CutMergeDistance,0.0);
+			for (int32 I=0; I<Data->ActiveCuts.Num(); ++I)
+			{
+				const FTOLActiveCut& Existing=Data->ActiveCuts[I];
+				if (Existing.SegmentIndex!=Segment) continue;
+				const double Distance=FMath::Abs(FVector::DotProduct(Plan.PlaneWorld-
+					Transform.TransformPosition(Existing.LocalPlanePoint),WorldAxis));
+				if (Distance<=Merge) { Merge=Distance; CutIndex=I; }
+			}
+			if (CutIndex!=INDEX_NONE) PlanePoint=Data->ActiveCuts[CutIndex].LocalPlanePoint;
+		}
+	}
 	if (!HasCutClearance(Mesh,Segment,PlanePoint,Axis,MinimumPieceLength)) return Finish(false);
 	if (CutIndex==INDEX_NONE)
 	{
@@ -1013,41 +1467,31 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	{
 		return false;
 	}
-	int32 SectionIndex = INDEX_NONE;
-	int32 TriangleIndex = INDEX_NONE;
-	if (!FindHitTriangle(SourceMesh, Current.Hit.FaceIndex, Current.LocalHitPoint, SectionIndex, TriangleIndex))
-	{
-		return false;
-	}
-	FVector SegmentAxis; int32 HitSegment=INDEX_NONE;
 	UTOLCutMeshData* SourceData=GetCutData(SourceMesh);
-	if (!SourceData || !FindLocalAxis(SourceMesh,Current.LocalHitPoint,TrunkAxisLocal.GetSafeNormal(),SegmentAxis,&HitSegment)) return false;
-	TArray<FProcMeshSection> Selected, Remainder;
-	ConnectedGeometry(SourceMesh,SectionIndex,TriangleIndex,Selected,Remainder);
-	const int32 OriginalSections=SourceMesh->GetNumSections();
-	UMaterialInterface* BarkMaterial=SourceMesh->GetMaterial(SectionIndex);
-	UMaterialInterface* CapMaterial=CutFaceMaterial ? CutFaceMaterial.Get() : BarkMaterial;
-	// Keep the root side. Centerline endpoints survive cuts and give a stable
-	// reference even when a branch is shorter than its cross-section.
-	FVector Root=SourceData->Segments[0].Start;
-	const FVector RootAxis=SourceData->GetTrunkAxis(TrunkAxisLocal);
-	for (const FTOLCutSegment& Segment : SourceData->Segments)
+	if (!SourceData) return false;
+	// ApplyChop already plans new cuts at a valid position; shifting here covers cuts whose geometry
+	// changed since they were started (another cut nearby) and direct CutHitSegment calls.
+	FBranchCutPlan Plan; FString BranchReason;
+	if (!PlanBranchCut(SourceMesh,Current.Hit,Current.LocalHitPoint,WorldPlanePoint,Current.WorldPlaneNormal,
+		TrunkAxisLocal,MinimumPieceLength,/*bAllowShift=*/true,Plan,BranchReason))
 	{
-		for (const FVector& P : {Segment.Start,Segment.End})
-			if (FVector::DotProduct(P,RootAxis)<FVector::DotProduct(Root,RootAxis)) Root=P;
-	}
-	const FVector RootWorld=SourceMesh->GetComponentTransform().TransformPosition(Root);
-	const FVector KeepNormal=FVector::DotProduct(RootWorld-WorldPlanePoint,Current.WorldPlaneNormal)>=0.0
-		? Current.WorldPlaneNormal : -Current.WorldPlaneNormal;
-	const FTransform Transform=SourceMesh->GetComponentTransform();
-	const FVector PlaneLocal=Transform.InverseTransformPosition(WorldPlanePoint);
-	const FVector KeepLocal=(Transform.GetScale3D()*Transform.InverseTransformVectorNoScale(KeepNormal)).GetSafeNormal();
-	if (!SelectBranchCut(SourceMesh,HitSegment,PlaneLocal,KeepLocal,Selected,Remainder))
-	{
-		UE_LOG(LogTemp, Display, TEXT("Cutting: rejected ambiguous/open branch boundary on %s, segment %d"),
-			*GetNameSafe(SourceMesh->GetOwner()),HitSegment);
+		UE_LOG(LogTemp, Display, TEXT("Cutting: rejected ambiguous/open branch boundary on %s, segment %d: %s"),
+			*GetNameSafe(SourceMesh->GetOwner()),Plan.HitSegment,*BranchReason);
 		return false;
 	}
+	if (Plan.Shift!=0.0)
+		UE_LOG(LogTemp, Display, TEXT("Cutting: plane on %s moved %.1f cm along segment %d (%s at the exact point)."),
+			*GetNameSafe(SourceMesh->GetOwner()),Plan.Shift,Plan.HitSegment,*BranchReason);
+	TArray<FProcMeshSection>& Selected=Plan.Selected;
+	TArray<FProcMeshSection>& Remainder=Plan.Remainder;
+	const FVector& PlaneLocal=Plan.PlaneLocal;
+	const FVector& KeepLocal=Plan.KeepLocal;
+	const FVector& KeepNormal=Plan.KeepNormal;
+	const FVector& SlicePoint=Plan.PlaneWorld;
+	const FTransform Transform=SourceMesh->GetComponentTransform();
+	const int32 OriginalSections=SourceMesh->GetNumSections();
+	UMaterialInterface* BarkMaterial=SourceMesh->GetMaterial(Plan.SectionIndex);
+	UMaterialInterface* CapMaterial=CutFaceMaterial ? CutFaceMaterial.Get() : BarkMaterial;
 	UProceduralMeshComponent* Preview=NewObject<UProceduralMeshComponent>(SourceMesh->GetOwner());
 	Preview->bUseComplexAsSimpleCollision=false;
 	Preview->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -1060,7 +1504,7 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 		Preview->SetMaterial(S,SourceMesh->GetMaterial(S));
 	}
 	UProceduralMeshComponent* OtherHalf=nullptr;
-	UKismetProceduralMeshLibrary::SliceProceduralMesh(Preview,WorldPlanePoint,KeepNormal,
+	UKismetProceduralMeshLibrary::SliceProceduralMesh(Preview,SlicePoint,KeepNormal,
 		true,OtherHalf,EProcMeshSliceCapOption::CreateNewSectionForCap,CapMaterial);
 	if (!OtherHalf || !RestoreCapBoundary(Preview,OriginalSections,PlaneLocal,KeepLocal) ||
 		!RestoreCapBoundary(OtherHalf,OtherHalf->GetNumSections()-1,PlaneLocal,KeepLocal))
@@ -1095,16 +1539,21 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	}
 	for (int32 S=0; S<OtherHalf->GetNumSections(); ++S)
 		if (const FProcMeshSection* Section=OtherHalf->GetProcMeshSection(S)) DetachedGeometry.Add(*Section);
-	double ParentVolume=0,KeptVolume=0,DetachedVolume=0; FString ValueError;
-	const bool CanValue=UTOLCutMeshData::MeasureMeshVolume(SourceMesh,ParentVolume,ValueError) &&
-		TOLCutValuation::Measure(KeptGeometry,Transform,KeptVolume,ValueError) &&
-		TOLCutValuation::Measure(DetachedGeometry,Transform,DetachedVolume,ValueError) &&
-		FMath::Abs(ParentVolume-KeptVolume-DetachedVolume)<=FMath::Max(ParentVolume*0.0001,1.e-10);
-	if ((SourceData->ValueMinor>0 || SourceData->UnitPricePerM3Minor>0) && (!CanValue || !SourceData->bValuationValid))
-	{
-		UE_LOG(LogTemp, Warning, TEXT("Cutting: priced split rolled back: %s"),*ValueError);
-		Fragment->Destroy(); OtherHalf->DestroyComponent(); Preview->DestroyComponent(); return false;
-	}
+	// Value is split by the volume ratio of the two pieces (CommitSplitValuation), so the total is conserved
+	// whichever measure is used. The exact closed-solid measure is preferred; when slicer caps leave
+	// micro-gaps it fails, and the tolerant measure takes over. A cut is never refused because of valuation
+	// (that used to leave priced trees impossible to cut at some angles, every hit failing again).
+	double KeptVolume=0,DetachedVolume=0; FString ValueError;
+	bool bKeptExact=false,bDetachedExact=false;
+	const bool CanValue=TOLCutValuation::MeasureBest(KeptGeometry,Transform,KeptVolume,ValueError,bKeptExact) &&
+		TOLCutValuation::MeasureBest(DetachedGeometry,Transform,DetachedVolume,ValueError,bDetachedExact) &&
+		KeptVolume>0 && DetachedVolume>0;
+	if (CanValue && !(bKeptExact && bDetachedExact))
+		UE_LOG(LogTemp, Display, TEXT("Cutting: approximate split volume on %s (kept %.4f m3, detached %.4f m3): %s"),
+			*GetNameSafe(SourceMesh->GetOwner()),KeptVolume,DetachedVolume,*ValueError);
+	if (!CanValue)
+		UE_LOG(LogTemp, Warning, TEXT("Cutting: split of %s could not be valued (%s); pieces have no value."),
+			*GetNameSafe(SourceMesh->GetOwner()),*ValueError);
 	TArray<FTOLActiveCut> KeptCuts;
 	for (const FTOLActiveCut& Active : SourceData->ActiveCuts)
 	{
@@ -1122,6 +1571,12 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 		Fragment->CutMesh->SetProcMeshSection(S,Section);
 		Fragment->CutMesh->SetMaterial(S,OtherHalf->GetMaterial(S));
 	}
+	// Leaves follow the piece that keeps their branch: same surface-membership test as ActiveCuts,
+	// never a half-space test (the plane extends through untouched branches).
+	UTOLTreeLeafSubsystem::TransferLeaves(SourceMesh,Fragment->CutMesh,[&](const FVector& Local)
+	{
+		return DistanceToGeometry(DetachedGeometry,Local)+0.000001<DistanceToGeometry(KeptGeometry,Local);
+	});
 	const bool WasSimulating=SourceMesh->IsSimulatingPhysics();
 	const FVector LinearVelocity=SourceMesh->GetPhysicsLinearVelocity();
 	const FVector AngularVelocity=SourceMesh->GetPhysicsAngularVelocityInRadians();
@@ -1149,8 +1604,11 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	}
 	RebuildConvexCollision(Fragment->CutMesh);
 	if (!SourceMesh->bUseComplexAsSimpleCollision) RebuildConvexCollision(SourceMesh);
+	ApplyPhysicalMass(Fragment->CutMesh,FragmentData);
 	if (WasSimulating)
 	{
+		// A re-cut simulated piece keeps its old override otherwise.
+		ApplyPhysicalMass(SourceMesh,SourceData);
 		SourceMesh->SetSimulatePhysics(true);
 		SourceMesh->SetPhysicsLinearVelocity(LinearVelocity);
 		SourceMesh->SetPhysicsAngularVelocityInRadians(AngularVelocity);
@@ -1162,9 +1620,9 @@ bool UTOLCutTraceComponent::SliceAtPlane(const FTOLCutTraceResult& Current, cons
 	RefreshCutMarks(SourceMesh,SourceData,CutMarkMaterial);
 	RefreshCutMarks(Fragment->CutMesh,FragmentData,CutMarkMaterial);
 	OutFragment = Fragment;
-	UE_LOG(LogTemp, Display, TEXT("Cutting: split %s into %s; %d preserved segment axes; physics=%s"),
+	UE_LOG(LogTemp, Display, TEXT("Cutting: split %s into %s; %d preserved segment axes; physics=%s; mass=%.1f kg"),
 		*GetNameSafe(SourceMesh->GetOwner()),*Fragment->GetName(),SourceData->Segments.Num(),
-		Fragment->CutMesh->IsSimulatingPhysics() ? TEXT("on") : TEXT("off"));
+		Fragment->CutMesh->IsSimulatingPhysics() ? TEXT("on") : TEXT("off"),Fragment->CutMesh->GetMass());
 	return true;
 }
 
@@ -1182,8 +1640,8 @@ void UTOLCutTraceComponent::DrawCutDebug(const FVector& TraceStart, const FVecto
 	if (GEngine) GEngine->RemoveOnScreenDebugMessage(FeedbackKey);
 	if (GEngine) GEngine->RemoveOnScreenDebugMessage(FeedbackKey+1);
 	const UStaticMeshComponent* StaticSource = Cast<UStaticMeshComponent>(Result.Hit.GetComponent());
-	const bool bDormantTree = StaticSource && DormantTreeProfiles.ContainsByPredicate(
-		[&](const FTOLDormantTreeProfile& Profile) { return Profile.Model.Mesh && Profile.Model.Mesh == StaticSource->GetStaticMesh(); });
+	// ApplyTreeHit has already resolved table-driven profiles for this mesh.
+	const bool bDormantTree = StaticSource && FindTreeProfileIndex(StaticSource->GetStaticMesh()) != INDEX_NONE;
 	if (GEngine && bCutOnValidTrace && (Result.bValidTreeHit || bDormantTree))
 	{
 		const FTOLChopResult& Chop = LastChopResult;
