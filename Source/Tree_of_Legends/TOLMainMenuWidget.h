@@ -82,9 +82,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Menu|Settings")
 	void OpenSettings();
 
+	/** Button that Esc (or the key bound to IA_Menu, or gamepad Start) presses to close this menu, e.g. B_Resume on
+	 * the pause menu. If no such button exists (main menu), the key does nothing. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Menu|Close")
+	FName CloseButtonName = TEXT("B_Resume");
+
 protected:
+	virtual void NativeOnInitialized() override;
 	virtual void NativeConstruct() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+	virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
+	virtual FReply NativeOnKeyUp(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
 	UFUNCTION()
 	void HandleSettingsClosed();
@@ -109,6 +117,10 @@ private:
 	void CollectWidgets();
 	void ApplyIntro(float BackgroundTime, float ItemTime);
 	void SetMenuItemsHidden(bool bHidden);
+	bool IsCloseKey(const FKey& Key) const;
+
+	/** Close key pressed while this menu was open; it closes on release. Ignores the release of the press that opened it. */
+	FKey PendingCloseKey;
 
 	TWeakObjectPtr<UImage> Background;
 	FLinearColor BackgroundColor = FLinearColor::White;

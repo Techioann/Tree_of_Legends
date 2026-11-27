@@ -5,6 +5,8 @@
 #include "Components/Image.h"
 #include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "InputCoreTypes.h"
+#include "TOLGameUserSettings.h"
 #include "TOLSettingsWidget.h"
 
 namespace
@@ -19,6 +21,13 @@ namespace
 				if (UTextBlock* Found = FindLabel(Child)) return Found;
 		return nullptr;
 	}
+}
+
+void UTOLMainMenuWidget::NativeOnInitialized()
+{
+	Super::NativeOnInitialized();
+	// Menus are shown with Set Input Mode UI Only; without this the focus request fails and keys never reach the menu.
+	SetIsFocusable(true);
 }
 
 void UTOLMainMenuWidget::NativeConstruct()
@@ -135,10 +144,49 @@ void UTOLMainMenuWidget::OpenSettings()
 	SetMenuItemsHidden(true);
 }
 
+bool UTOLMainMenuWidget::IsCloseKey(const FKey& Key) const
+{
+	if (Key == EKeys::Escape || Key == EKeys::Gamepad_Special_Right) return true;
+	// The player may have moved the menu key in Settings > Controls.
+	if (const UTOLGameUserSettings* Settings = UTOLGameUserSettings::Get())
+		for (const FTOLKeyOverride& Override : Settings->KeyOverrides)
+			if (Override.Action == TEXT("IA_Menu") && Override.Key == Key) return true;
+	return false;
+}
+
+FReply UTOLMainMenuWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+	const FKey Key = InKeyEvent.GetKey();
+	if (!IsCloseKey(Key) || InKeyEvent.IsRepeat()) return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+
+	// Settings on top (it normally has focus itself; this covers focus lost to a click elsewhere).
+	if (SettingsWidget && SettingsWidget->IsInViewport())
+	{
+		SettingsWidget->RequestClose();
+		return FReply::Handled();
+	}
+	const UButton* CloseButton = WidgetTree && !CloseButtonName.IsNone() ? Cast<UButton>(WidgetTree->FindWidget(CloseButtonName)) : nullptr;
+	if (!CloseButton || !CloseButton->GetIsEnabled()) return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+	PendingCloseKey = Key;
+	return FReply::Handled();
+}
+
+FReply UTOLMainMenuWidget::NativeOnKeyUp(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+	if (!PendingCloseKey.IsValid() || InKeyEvent.GetKey() != PendingCloseKey) return Super::NativeOnKeyUp(InGeometry, InKeyEvent);
+	PendingCloseKey = FKey();
+	// Closing on release: back in Game Only input the key is no longer held, so IA_Menu cannot reopen the menu.
+	if (UButton* CloseButton = WidgetTree ? Cast<UButton>(WidgetTree->FindWidget(CloseButtonName)) : nullptr)
+		CloseButton->OnClicked.Broadcast(); // same as clicking it: the Blueprint's Resume logic runs
+	return FReply::Handled();
+}
+
 void UTOLMainMenuWidget::HandleSettingsClosed()
 {
 	SettingsWidget = nullptr;
+	PendingCloseKey = FKey();
 	SetMenuItemsHidden(false);
+	SetKeyboardFocus(); // so Esc works again right away
 	// Bring the title and buttons back with the intro motion, without fading the background again.
 	ItemElapsed = 0.f;
 	ApplyIntro(Elapsed, ItemElapsed);

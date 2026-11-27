@@ -1092,6 +1092,12 @@ UTOLSettingsWidget* UTOLSettingsWidget::OpenSettings(UObject* WorldContextObject
 		Widget = CreateWidget<UTOLSettingsWidget>(Controller, Class);
 	else
 		Widget = CreateWidget<UTOLSettingsWidget>(World, Class);
-	if (Widget) Widget->AddToViewport(ZOrder);
+	if (Widget)
+	{
+		Widget->AddToViewport(ZOrder);
+		// Focus the menu so Esc (back / cancel dialog) and gamepad shoulders work without clicking it first.
+		if (Widget->Menu.IsValid() && FSlateApplication::IsInitialized())
+			FSlateApplication::Get().SetAllUserFocus(Widget->Menu, EFocusCause::SetDirectly);
+	}
 	return Widget;
 }
