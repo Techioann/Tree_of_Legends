@@ -5,6 +5,7 @@
 #include "Components/Image.h"
 #include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "TOLSettingsWidget.h"
 
 namespace
 {
@@ -25,6 +26,9 @@ void UTOLMainMenuWidget::NativeConstruct()
 	Super::NativeConstruct();
 	CollectWidgets();
 	PlayIntro();
+	if (!IsDesignTime() && !SettingsButtonName.IsNone() && WidgetTree)
+		if (UButton* SettingsButton = Cast<UButton>(WidgetTree->FindWidget(SettingsButtonName)))
+			SettingsButton->OnClicked.AddUniqueDynamic(this, &UTOLMainMenuWidget::OpenSettings);
 }
 
 void UTOLMainMenuWidget::CollectWidgets()
@@ -62,22 +66,23 @@ void UTOLMainMenuWidget::CollectWidgets()
 void UTOLMainMenuWidget::PlayIntro()
 {
 	Elapsed = 0.f;
+	ItemElapsed = 0.f;
 	if (IsDesignTime()) return; // the Designer shows the final layout
-	ApplyIntro(0.f);
+	ApplyIntro(0.f, 0.f);
 }
 
-void UTOLMainMenuWidget::ApplyIntro(float Time)
+void UTOLMainMenuWidget::ApplyIntro(float BackgroundTime, float ItemTime)
 {
 	if (UImage* Image = Background.Get())
 	{
-		const float T = BackgroundFadeTime > 0.f ? EaseOutCubic(Time / BackgroundFadeTime) : 1.f;
+		const float T = BackgroundFadeTime > 0.f ? EaseOutCubic(BackgroundTime / BackgroundFadeTime) : 1.f;
 		const FLinearColor From(0.f, 0.f, 0.f, BackgroundColor.A);
 		Image->SetColorAndOpacity(FMath::Lerp(From, BackgroundColor, T));
 	}
 	for (const FItemFx& Item : Items)
 		if (UWidget* Widget = Item.Widget.Get())
 		{
-			const float T = EaseOutCubic((Time - Item.Delay) / ItemIntroTime);
+			const float T = EaseOutCubic((ItemTime - Item.Delay) / ItemIntroTime);
 			Widget->SetRenderOpacity(T);
 			Widget->SetRenderTranslation(Item.From * (1.f - T));
 		}
@@ -90,7 +95,8 @@ void UTOLMainMenuWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 	if (!bCollected) CollectWidgets();
 	const float Dt = FMath::Min(InDeltaTime, 0.1f); // no jump after a hitch
 	Elapsed += Dt;
-	ApplyIntro(Elapsed);
+	ItemElapsed += Dt;
+	ApplyIntro(Elapsed, ItemElapsed);
 
 	if (UImage* Image = Background.Get())
 	{
@@ -108,7 +114,7 @@ void UTOLMainMenuWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 		const bool bActive = Button->GetIsEnabled() && (Button->IsHovered() || Button->HasKeyboardFocus());
 		Fx.Hover = FMath::Lerp(Fx.Hover, bActive ? 1.f : 0.f, Blend);
 		Fx.Press = FMath::Lerp(Fx.Press, Button->IsPressed() ? 1.f : 0.f, Blend);
-		const float In = EaseOutCubic((Elapsed - Fx.Delay) / ItemIntroTime);
+		const float In = EaseOutCubic((ItemElapsed - Fx.Delay) / ItemIntroTime);
 		Button->SetRenderOpacity(In);
 		Button->SetRenderTranslation(FVector2D(-SlideDistance * (1.f - In) + HoverShift * Fx.Hover, 0.0));
 		Button->SetRenderScale(FVector2D(1.0 - 0.04 * Fx.Press));
@@ -118,4 +124,42 @@ void UTOLMainMenuWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTi
 			Label->SetColorAndOpacity(FSlateColor(FMath::Lerp(Base, HoverTextColor, Fx.Hover)));
 		}
 	}
+}
+
+void UTOLMainMenuWidget::OpenSettings()
+{
+	if (SettingsWidget && SettingsWidget->IsInViewport()) return;
+	SettingsWidget = UTOLSettingsWidget::OpenSettings(this, SettingsWidgetClass, 100);
+	if (!SettingsWidget) return;
+	SettingsWidget->OnClosed.AddUniqueDynamic(this, &UTOLMainMenuWidget::HandleSettingsClosed);
+	SetMenuItemsHidden(true);
+}
+
+void UTOLMainMenuWidget::HandleSettingsClosed()
+{
+	SettingsWidget = nullptr;
+	SetMenuItemsHidden(false);
+	// Bring the title and buttons back with the intro motion, without fading the background again.
+	ItemElapsed = 0.f;
+	ApplyIntro(Elapsed, ItemElapsed);
+}
+
+void UTOLMainMenuWidget::SetMenuItemsHidden(bool bHidden)
+{
+	if (bHidden)
+	{
+		TArray<UWidget*> Widgets;
+		for (const FItemFx& Item : Items) Widgets.Add(Item.Widget.Get());
+		if (WidgetTree) Widgets.Add(WidgetTree->FindWidget(ButtonPanelName));
+		for (UWidget* Widget : Widgets)
+			if (Widget && !HiddenItems.Contains(Widget))
+			{
+				HiddenItems.Add(Widget, Widget->GetVisibility());
+				Widget->SetVisibility(ESlateVisibility::Hidden);
+			}
+		return;
+	}
+	for (const TPair<TWeakObjectPtr<UWidget>, ESlateVisibility>& Entry : HiddenItems)
+		if (UWidget* Widget = Entry.Key.Get()) Widget->SetVisibility(Entry.Value);
+	HiddenItems.Reset();
 }

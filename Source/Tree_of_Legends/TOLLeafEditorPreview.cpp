@@ -142,7 +142,9 @@ void UTOLLeafEditorPreview::Refresh()
 	// Same dormant tree kinds the game handles: Static Mesh Actors and instanced (foliage) components.
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
+#if WITH_EDITOR
 		if (It->IsHiddenEd()) continue;
+#endif
 		if (AStaticMeshActor* Actor=Cast<AStaticMeshActor>(*It)) Visit(Actor->GetStaticMeshComponent());
 		TInlineComponentArray<UInstancedStaticMeshComponent*> Components(*It);
 		for (UInstancedStaticMeshComponent* Instances : Components) Visit(Instances);

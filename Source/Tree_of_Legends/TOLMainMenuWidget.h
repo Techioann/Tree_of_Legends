@@ -8,6 +8,7 @@ class UButton;
 class UTextBlock;
 class UWidget;
 class UImage;
+class UTOLSettingsWidget;
 
 /**
  * Parent class of WB_MainMenu: motion for an otherwise static layout. Widgets are found by name, so the
@@ -69,9 +70,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Menu")
 	void PlayIntro();
 
+	/** Button that opens the settings menu (found by name, like the others). Leave empty to open it only from Blueprint. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Menu|Settings")
+	FName SettingsButtonName = TEXT("B_Settings");
+
+	/** Settings menu class; empty = the C++ UTOLSettingsWidget. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Menu|Settings")
+	TSubclassOf<UTOLSettingsWidget> SettingsWidgetClass;
+
+	/** Opens the settings menu on top and hides this menu's title and buttons until it closes. */
+	UFUNCTION(BlueprintCallable, Category="Menu|Settings")
+	void OpenSettings();
+
 protected:
 	virtual void NativeConstruct() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
+
+	UFUNCTION()
+	void HandleSettingsClosed();
 
 private:
 	struct FButtonFx
@@ -91,12 +107,17 @@ private:
 	};
 
 	void CollectWidgets();
-	void ApplyIntro(float Time);
+	void ApplyIntro(float BackgroundTime, float ItemTime);
+	void SetMenuItemsHidden(bool bHidden);
 
 	TWeakObjectPtr<UImage> Background;
 	FLinearColor BackgroundColor = FLinearColor::White;
 	TArray<FButtonFx> Buttons;
 	TArray<FItemFx> Items;
-	float Elapsed = 0.f;
+	float Elapsed = 0.f;     // background time (fade-in, Ken Burns)
+	float ItemElapsed = 0.f; // title and button intro time
+	TMap<TWeakObjectPtr<UWidget>, ESlateVisibility> HiddenItems;
+	UPROPERTY(Transient)
+	TObjectPtr<UTOLSettingsWidget> SettingsWidget;
 	bool bCollected = false;
 };
