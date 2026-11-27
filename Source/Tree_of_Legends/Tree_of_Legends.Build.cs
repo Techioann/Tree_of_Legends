@@ -7,10 +7,13 @@ public class Tree_of_Legends : ModuleRules
 	public Tree_of_Legends(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-	
+		// The cutting .cpp files share helper names (WeldKey, GetTriangle, FMeshEdge) in their anonymous
+		// namespaces; unity builds merge them into one translation unit and fail to compile.
+		bUseUnity = false;
+
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "DeveloperSettings" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "ProceduralMeshComponent", "EnhancedInput", "AssetRegistry", "PhysicsCore", "UMG" });
+		PrivateDependencyModuleNames.AddRange(new string[] { "ProceduralMeshComponent", "EnhancedInput", "AssetRegistry", "PhysicsCore", "UMG", "Slate", "SlateCore", "MoviePlayer", "RenderCore", "RHI" });
 		DynamicallyLoadedModuleNames.Add("OnlineSubsystemSteam");
 
 		// Uncomment if you are using Slate UI

@@ -123,7 +123,7 @@ public:
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Visibility;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Debug")
-	bool bDrawDebug = true;
+	bool bDrawDebug = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Debug", meta=(ClampMin="0.0"))
 	float DebugDuration = 3.0f;
