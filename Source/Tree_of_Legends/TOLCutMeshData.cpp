@@ -1,5 +1,59 @@
 #include "TOLCutMeshData.h"
 #include "ProceduralMeshComponent.h"
+#include "TOLCutValuation.h"
+
+bool UTOLCutMeshData::MeasureMeshVolume(UProceduralMeshComponent* Mesh,double& OutVolumeM3,FString& OutError)
+{
+	OutVolumeM3=0; OutError.Empty();
+	if (!Mesh) { OutError=TEXT("Missing mesh."); return false; }
+	TArray<FProcMeshSection> Sections;
+	for (int32 S=0; S<Mesh->GetNumSections(); ++S)
+		if (const FProcMeshSection* Section=Mesh->GetProcMeshSection(S)) Sections.Add(*Section);
+	// A tiny crack in an imported or sliced mesh must not leave a tree without value or mass (that made
+	// priced trees uncuttable): fall back to the tolerant measure and report why the exact one failed.
+	bool bExact=false;
+	if (!TOLCutValuation::MeasureBest(Sections,Mesh->GetComponentTransform(),OutVolumeM3,OutError,bExact)) return false;
+	if (!bExact)
+		UE_LOG(LogTemp, Verbose, TEXT("Cutting: approximate volume %.4f m3 for %s (%s)"),OutVolumeM3,*GetNameSafe(Mesh->GetOwner()),*OutError);
+	OutError.Empty();
+	return true;
+}
+
+bool UTOLCutMeshData::ConfigureValuation(int64 PricePerM3Minor,FString& OutError)
+{
+	OutError.Empty();
+	if (bHasBeenChopped || bFragment || bGeometryModified || !ActiveCuts.IsEmpty())
+	{ OutError=TEXT("A chopped tree/fragment cannot be repriced."); return false; }
+	if (PricePerM3Minor<0 || PricePerM3Minor>TOLCutValuation::MaxMoney)
+	{ OutError=TEXT("Unit price is outside the supported money range."); return false; }
+	double Volume=0;
+	if (!MeasureMeshVolume(BoundMesh,Volume,OutError)) return false;
+	const double Money=Volume*double(PricePerM3Minor);
+	if (!FMath::IsFinite(Money) || Money>TOLCutValuation::MaxMoney)
+	{ OutError=TEXT("Tree value exceeds the supported money range."); return false; }
+	UnitPricePerM3Minor=PricePerM3Minor; VolumeM3=Volume;
+	ValueMinor=FMath::RoundToInt64(Money); bValuationValid=true;
+	ValuationMessage=PricePerM3Minor>0 ? TEXT("Valuation ready.") : TEXT("Volume ready; configure a unit price before chopping.");
+	return true;
+}
+
+void UTOLCutMeshData::CommitSplitValuation(UTOLCutMeshData* Fragment,double KeptVolume,double DetachedVolume)
+{
+	check(Fragment && KeptVolume>0 && DetachedVolume>0);
+	const int64 DetachedValue=FMath::Clamp<int64>(FMath::RoundToInt64(double(ValueMinor)*
+		(DetachedVolume/(KeptVolume+DetachedVolume))),0,ValueMinor);
+	Fragment->UnitPricePerM3Minor=UnitPricePerM3Minor;
+	Fragment->VolumeM3=DetachedVolume; Fragment->ValueMinor=DetachedValue;
+	Fragment->bValuationValid=bValuationValid; Fragment->ValuationMessage=ValuationMessage;
+	VolumeM3=KeptVolume; ValueMinor-=DetachedValue;
+}
+
+FText UTOLCutMeshData::GetValueText() const
+{
+	if (!bValuationValid) return FText::FromString(TEXT("Value unavailable"));
+	if (UnitPricePerM3Minor==0) return FText::FromString(FString::Printf(TEXT("%.4f m3 | price not configured"),VolumeM3));
+	return FText::FromString(FString::Printf(TEXT("%.4f m3 | %lld.%02lld coins"),VolumeM3,ValueMinor/100,ValueMinor%100));
+}
 
 bool UTOLCutMeshData::ConfigureMaterial(FDataTableRowHandle MaterialRow, double Resistance)
 {
@@ -220,6 +274,13 @@ namespace
 	}
 }
 
+TArray<FTOLCutSegment> UTOLCutMeshData::ComputeModelSegments(UStaticMesh* Mesh, const FTOLTreeMeshConfiguration& Configuration)
+{
+	if (Configuration.SegmentMode==ETOLCutSegmentMode::Authored) return Configuration.AuthoredSegments;
+	if (!Mesh || !Mesh->bAllowCPUAccess || !Mesh->GetRenderData() || Mesh->GetNumLODs()<1) return {};
+	return DetectSegments(MakeModelPreview(GetTransientPackage(),Mesh));
+}
+
 bool UTOLCutMeshData::ValidateTreeConfiguration(UStaticMeshComponent* SourceTree, FString& OutError) const
 {
 	OutError.Empty();
@@ -276,6 +337,11 @@ bool UTOLCutMeshData::InitializeTree(UStaticMeshComponent* SourceTree,
 	bModelConfigured=true;
 	BoundConfigurationHash=ConfigurationHash();
 	bSegmentsValid=true;
+	FString ValueError;
+	if (!ConfigureValuation(UnitPricePerM3Minor,ValueError))
+	{
+		bValuationValid=false; VolumeM3=0; ValueMinor=0; ValuationMessage=ValueError;
+	}
 	ValidationMessage=FString::Printf(TEXT("%s: %d structurally valid segments; branch coverage requires visual verification."),
 		*Selected->GetName(),Segments.Num());
 	SourceTree->SetVisibility(false);

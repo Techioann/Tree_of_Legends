@@ -4,12 +4,14 @@
 #include "Components/ActorComponent.h"
 #include "Engine/HitResult.h"
 #include "Engine/DataTable.h"
+#include "UObject/ObjectKey.h"
 #include "TOLCutMeshData.h"
 #include "TOLCutTraceComponent.generated.h"
 
 class UPrimitiveComponent;
 class ATOLCutFragment;
 class UMaterialInterface;
+class UStaticMesh;
 
 USTRUCT(BlueprintType)
 struct FTOLDormantTreeProfile
@@ -21,6 +23,9 @@ struct FTOLDormantTreeProfile
 	FDataTableRowHandle TreeData;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting", meta=(ClampMin="0.001"))
 	double ResistanceMultiplier = 1.0;
+	/** Minor currency units per cubic metre. 0 = use the DT_Tree "Price Per M3" column (coins) instead. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Value", meta=(ClampMin="0"))
+	int64 UnitPricePerM3Minor = 0;
 };
 
 USTRUCT(BlueprintType)
@@ -93,9 +98,13 @@ public:
 	UTOLCutTraceComponent();
 	virtual void BeginPlay() override;
 
-	/** Exact Static Mesh references, never actor labels or substring matches. */
+	/** Optional per-mesh overrides (exact Static Mesh references). Normally leave empty: trees are
+	 * configured by TreeTable rows, and resolved rows are appended here at runtime. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Cutting|Activation")
 	TArray<FTOLDormantTreeProfile> DormantTreeProfiles;
+	/** DT_Tree (row type FTOLTreeRow). Empty = DefaultTreeData's table. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Activation")
+	TObjectPtr<UDataTable> TreeTable;
 	UPROPERTY(Transient, BlueprintReadOnly, Category="Cutting|Activation")
 	TObjectPtr<AActor> LastActivatedTree;
 
@@ -114,7 +123,7 @@ public:
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Visibility;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Debug")
-	bool bDrawDebug = true;
+	bool bDrawDebug = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Cutting|Debug", meta=(ClampMin="0.0"))
 	float DebugDuration = 3.0f;
@@ -187,8 +196,32 @@ public:
 	/** Inventory/Blueprint runtime entry point; equipping explicitly supplies saved durability. */
 	UFUNCTION(BlueprintCallable, Category="Cutting|Axe")
 	bool EquipAxe(FDataTableRowHandle Row, double RemainingDurability);
+	/** Applies to future activations only; never reprices existing trees/fragments. */
+	UFUNCTION(BlueprintCallable, Category="Cutting|Value")
+	bool SetDormantTreeUnitPrice(UStaticMesh* Model, int64 PricePerM3Minor);
+
+	UFUNCTION(BlueprintPure, Category="Cutting|Activation")
+	UDataTable* GetTreeTable() const;
+
+	/** Editor: adds a TreeTable row Tree_<X> for every SM_Tree_<X> mesh that has none, and fills empty Mesh
+	 * columns of matching rows. Same as the console command TOL.SyncTreeTable. Save DT_Tree afterwards. */
+	UFUNCTION(CallInEditor, Category="Cutting|Activation")
+	void SyncTreeTable();
+
+	/** Returns the number of rows added or linked, or -1 if the table cannot be synced. */
+	static int32 SyncTreeTableWithMeshes(UDataTable* Table, FName TemplateRow);
+
+	/** Read-only lookup (explicit profile, else TreeTable) without caching; used by the editor leaf preview. */
+	bool FindTreeModel(UStaticMesh* Mesh, FTOLTreeMeshConfiguration& OutModel) const;
 
 private:
+	/** Fills empty AxeData/DefaultTreeData tables from UTOLCutSettings; reports loudly if the axe row is missing. */
+	void ResolveDefaultTables();
+	/** Explicit profile, else a profile built from TreeTable (and cached). INDEX_NONE = not a tree or ambiguous. */
+	int32 ResolveTreeProfileIndex(const UStaticMesh* Mesh);
+	int32 FindTreeProfileIndex(const UStaticMesh* Mesh) const;
+	bool BuildProfileFromTable(UStaticMesh* Mesh, FTOLDormantTreeProfile& OutProfile) const;
+	TSet<TObjectKey<UStaticMesh>> NonTreeMeshes;
 	bool CalculateChopValues(FDataTableRowHandle Material, double Resistance,
 		double& OutGain, double& OutWear, double& OutHealth) const;
 	bool TryActivateTree(const FHitResult& Hit, FTOLCutTraceResult& OutTrace, FTOLChopResult& OutChop);

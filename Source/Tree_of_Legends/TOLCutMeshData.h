@@ -85,6 +85,27 @@ public:
 	UPROPERTY(Transient)
 	TObjectPtr<class UProceduralMeshComponent> CutMarks;
 
+	/** 100 minor units = one displayed coin. Zero leaves the price unconfigured. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Cutting|Value", meta=(ClampMin="0"))
+	int64 UnitPricePerM3Minor = 0;
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Cutting|Value")
+	double VolumeM3 = 0;
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Cutting|Value")
+	int64 ValueMinor = 0;
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Cutting|Value")
+	bool bValuationValid = false;
+	UPROPERTY(Transient, BlueprintReadOnly, Category="Cutting|Value")
+	FString ValuationMessage;
+
+	UFUNCTION(BlueprintCallable, Category="Cutting|Value")
+	static bool MeasureMeshVolume(class UProceduralMeshComponent* Mesh, double& OutVolumeM3, FString& OutError);
+	/** Pricing may be configured only before the first chop; it never refills a fragment's value. */
+	UFUNCTION(BlueprintCallable, Category="Cutting|Value")
+	bool ConfigureValuation(int64 PricePerM3Minor, FString& OutError);
+	UFUNCTION(BlueprintPure, Category="Cutting|Value")
+	FText GetValueText() const;
+	void CommitSplitValuation(UTOLCutMeshData* Fragment, double KeptVolume, double DetachedVolume);
+
 	/** Runtime configuration; refuses to change material while cuts are in progress. */
 	UFUNCTION(BlueprintCallable, Category="Cutting|Material")
 	bool ConfigureMaterial(FDataTableRowHandle MaterialRow, double Resistance = 1.0);
@@ -101,6 +122,9 @@ public:
 		class UStaticMeshComponent* SourceTree, class UProceduralMeshComponent* ProceduralTree, FString& OutError);
 	UFUNCTION(BlueprintCallable, Category="Cutting|Validation")
 	bool ValidateTreeConfiguration(class UStaticMeshComponent* SourceTree, FString& OutError) const;
+
+	/** Segments a model would use once activated (authored, or detected from LOD 0). Empty if unreadable. */
+	static TArray<FTOLCutSegment> ComputeModelSegments(class UStaticMesh* Mesh, const FTOLTreeMeshConfiguration& Configuration);
 
 	bool EnsureSegments(class UProceduralMeshComponent* Mesh);
 	void MarkChopped() { bHasBeenChopped = true; }
